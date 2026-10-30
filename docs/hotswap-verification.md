@@ -7,10 +7,15 @@
 
 ## 结论
 
-**成立。** 一个 40 秒的流式推理请求跨过了插件从 v0.1.2 到 v0.1.3 的热替换：
-请求正常结束（40/40 token、`[DONE]`、usage 块齐全），CPA 进程 PID、容器
-`StartedAt`、`RestartCount` 三项全程不变，替换后 `/v0/management/plugins`
-报告 v0.1.3，CPA 日志里是 `plugin hot reloaded`，没有 `error` / `fatal` / `panic`。
+**AC-5（在途请求不断、PID 不变）成立。** 一个 40 秒的流式推理请求跨过了插件从
+v0.1.2 到 v0.1.3 的热替换：请求正常结束（40/40 token、`[DONE]`、usage 块齐全），
+CPA 进程 PID、容器 `StartedAt`、`RestartCount` 三项全程不变，替换后
+`/v0/management/plugins` 报告 v0.1.3，CPA 日志里是 `plugin hot reloaded`，
+没有 `error` / `fatal` / `panic`，也没有 quiesce drain 超时。
+
+**但 SPEC 4.1 的「等手上的采集中止」只有部分验证，不能整体标为满足。**
+合作取消路径已验证；不理会取消的采集中止不了，5 秒后放弃并把超时**记录/上报**出来，
+宿主仍会卸载插件（改这一点需要改 CPA，另立票）。逐条见「quiesce 与 SPEC 4.1 的差距」。
 
 ## 这是独立的测试实例 + fixture 环境
 
@@ -28,13 +33,17 @@
 **真实 Ollama 凭证的验收是 #5，由浩文本人做。** 本文件里的任何结论都不表示
 真实 Ollama 账号能被正确读取。
 
-脚本的前置检查会在以下任一情况**直接拒绝运行**（已实测）：
+脚本的前置检查会在以下任一情况**直接拒绝运行**：
 
 - 端口 `18999` 或 `18080` 已被监听
 - 容器名 `ollama-hotswap-test` / `ollama-hotswap-upstream` 已存在
+- 运行中的容器把某个目录挂进了临时目录（相等 / 祖先 / 后代都算）
 - 临时目录不是全新建的
 
-拒绝时退出码为 1，并且不启动任何东西。
+拒绝时退出码为 1，**不启动任何容器，也不执行任何 `docker rm`**（包括不会删掉那个
+同名的、别人的容器）。这条不是靠读代码保证的：`scripts/verify-hotswap-guards.sh`
+用记录型 `docker` 替身逐条验证了「拒绝路径 `docker rm` 调用数为 0」，
+证据见下面的「安全前置与反向验证」。
 
 ## 环境
 
@@ -65,20 +74,23 @@
     container name ollama-hotswap-test is unused
     container name ollama-hotswap-upstream is unused
     plugin versions: v0.1.2 (committed) -> v0.1.3 (second build)
-    temp dir /tmp/ollama-hotswap.O9RDkG is new
+    temp dir /tmp/ollama-hotswap.73jTbE is new
+    no running container mounts a tree containing /tmp/ollama-hotswap.73jTbE
     images present: eceasy/cli-proxy-api:v8.0.47, golang:1.26-bookworm
 
 === building the fixtures (fake upstream + plugin v0.1.2 and v0.1.3)
 go: downloading github.com/router-for-me/CLIProxyAPI/v8 v8.0.47
 go: downloading github.com/router-for-me/CLIProxyAPI/v8 v8.0.47
-    v1 6166992 bytes
-    v2 6166992 bytes, differs from v1
-    the tree's plugin.go is back to 0.1.2
+    v1 6172848 bytes
+    v2 6172848 bytes, differs from v1
+    the working tree's plugin.go was never modified (still v0.1.2)
 
 === starting the fake upstream on 127.0.0.1:18080
+    upstream container b0fe1f7e9a1de1074a76e8aac42ad17fc6a619030d6f1bca6ce584a39e8b9050
     upstream healthy
 
 === starting the isolated CPA instance on 127.0.0.1:18999
+    CPA container 7b594faeb550aeaca6f70c9292bd11b051429d339dcb517020b31103d7326685
     CPA answered
 
 === enabling plugin v0.1.2
@@ -87,7 +99,7 @@ go: downloading github.com/router-for-me/CLIProxyAPI/v8 v8.0.47
 
 === starting a 40s streaming request
     request is streaming (1 tokens so far)
-    PID during the request: 3249121 (before: 3249121)
+    PID during the request: 3374416 (before: 3374416)
 
 === swapping the plugin file to v0.1.3 while the request is open
     host reports v0.1.3
@@ -96,14 +108,15 @@ go: downloading github.com/router-for-me/CLIProxyAPI/v8 v8.0.47
 === assertions
 
 request timeline (UTC)
-  started         2026-10-30T10:23:56Z
-  swap confirmed  +10s
-  ended           2026-10-30T10:24:36Z (after 40s)
+  started         2026-10-30T10:57:49Z
+  swap confirmed  +9s
+  ended           2026-10-30T10:58:29Z
+  measured        40s (the acceptance gate needs >30s)
   response        8207 bytes, 40/40 distinct tokens
 
 CPA process
-  PID           before=3249121  mid=3249121  after=3249121
-  StartedAt     before=2026-10-30T10:23:54.819588535Z  after=2026-10-30T10:23:54.819588535Z
+  PID           before=3374416  mid=3374416  after=3374416
+  StartedAt     before=2026-10-30T10:57:47.564568544Z  after=2026-10-30T10:57:47.564568544Z
   RestartCount  before=0  after=0
 
 results
@@ -113,21 +126,24 @@ results
   PASS  the upstream finished normally — finish_reason=stop
   PASS  the final usage chunk arrived — completion_tokens present
   PASS  every token arrived — 40/40
-  PASS  the request spanned the swap — started 2026-10-30T10:23:56Z, swap at +10s, ended 2026-10-30T10:24:36Z
-  PASS  the CPA process kept its PID — 3249121 throughout
+  PASS  the request spanned the swap — started 2026-10-30T10:57:49Z, swap at +9s, ended 2026-10-30T10:58:29Z
+  PASS  the request outlived 30 seconds — measured 40s
+  PASS  the CPA process kept its PID — 3374416 throughout
   PASS  the container was not restarted — StartedAt unchanged
   PASS  no restart was counted — RestartCount 0
   PASS  the new plugin version is live — v0.1.3
   PASS  CPA logged a hot reload, not a reload from scratch — active_version=0.1.3
+  PASS  no quiesce drain timed out — every quiesce drained within the bound
   PASS  CPA logged no errors — 0 error/fatal lines
   PASS  CPA did not panic — clean
 
-PASS  hot swap verified: the request crossed the swap intact, the CPA process kept PID 3249121, and v0.1.3 is live
+PASS  hot swap verified: a 40s request (measured) crossed the swap intact, the CPA process kept PID 3374416, and v0.1.3 is live
 
 === cleanup
-    removed container ollama-hotswap-test
-    removed container ollama-hotswap-upstream
-    removed /tmp/ollama-hotswap.O9RDkG
+    removed the CPA container this run started (7b594faeb550aeaca6f70c9292bd11b051429d339dcb517020b31103d7326685)
+    removed the upstream container this run started (b0fe1f7e9a1de1074a76e8aac42ad17fc6a619030d6f1bca6ce584a39e8b9050)
+    removed build scratch /tmp/hotswap-src.kdKPNl
+    removed /tmp/ollama-hotswap.73jTbE
 ```
 
 ## 断言逐条说明
@@ -188,11 +204,13 @@ CPA（v8.0.47）在**应用配置**时扫描插件目录：`pluginHost.ApplyConf
 
 | 测试 | 断言 |
 |---|---|
-| `TestQuiesceWaitsForInFlightFetch` | quiesce 返回时，手上那次采集**已经结束**，不是"发了取消就返回" |
-| `TestQuiesceReturnsWhenFetchIgnoresCancellation` | 不理会取消的采集最多拖 5 秒，不会把热替换永久卡住 |
+| `TestQuiesceWaitsForInFlightFetch` | **合作取消**路径：quiesce 返回时手上那次采集已经结束，且 `LastDrain` 报告 `TimedOut=false` |
+| `TestQuiesceTimeoutIsObservable` | **不理会取消**的采集：5 秒后放弃，`LastDrain` 记录 `TimedOut=true, InFlight=1`；不假装成功 |
+| `TestQuiesceTimeoutSurfacesAsErrorEnvelope` | 同一场景的 RPC 面：返回 `ok:false`、code `quiesce_drain_timeout`、`detail.in_flight`，phase 仍是 `quiescing` |
+| `TestCleanQuiesceEnvelopeIsSuccess` | 反面对照：干净 drain 仍是普通成功，超时码只在真超时出现 |
 | `TestQuiesceWithoutTrackedWorkReturnsImmediately` | 没有在途采集时 quiesce 不做 5 秒无谓等待 |
 | `TestFetchAfterQuiesceIsRefusedWithAClearError` | quiesce 后 `quota.fetch` / `quota.describe` 被拒，错误码 `plugin_quiesced`，消息非空 |
-| `TestPluginNeverServesInferenceSurface` | 推理 / 执行器相关的 12 个方法在 active、quiescing、stopped 三态下**全部** `unknown_method` |
+| `TestPluginNeverServesInferenceSurface` | 推理 / 执行器相关的 16 个真实 ABI 方法在 active、quiescing、stopped 三态下**全部** `unknown_method` |
 | `TestRollbackRegisterAfterQuiesceServesAgain` | quiesce 后重新注册能恢复实例并继续出额度 |
 
 `TestPluginNeverServesInferenceSurface` 是「quiesce 期间推理不受影响」这条的
@@ -205,29 +223,45 @@ CPA（v8.0.47）在**应用配置**时扫描插件目录：`pluginHost.ApplyConf
 SPEC 4.1 要求：收到 quiesce 后**拒绝新请求、等手上的采集中止、释放连接池**。
 逐条核对 #1 的实现：
 
-| 要求 | #1 的情况 | 本票处理 |
+| 要求 | 状态 | 证据与边界 |
 |---|---|---|
-| 拒绝新请求 | 已满足：`Quiesce` 先把 phase 置 `PhaseQuiescing`，之后 `Provider()` 返回 false，`quota.fetch` / `quota.describe` / `quota.reset` 都回 `plugin_quiesced` | 无需改动，加了测试钉住 |
-| **等手上采集中止** | **缺口**：`CancelAll()` 只发取消信号就返回；`provider.Track` 的 `release` 之后才跑完，实际采集可能还在写返回值 | **已补**：`Provider` 增加 `inflight` 计数，`Quiesce` / `Shutdown` 在取消后 `drain(drainTimeout)` 等它归零，超时上限 5 秒（见下） |
-| 释放连接池 | 插件自己不开连接池；采集走 CPA 注入的 transport（#3）。能释放的只有 `CancelAll` 取消掉的那些请求 | 由 drain 覆盖 |
-| 推理请求不受影响 | 插件不注册任何推理 / 执行器能力 | 单测 + 实测双证（见上） |
-| quiesce 后能恢复 | `Register` 在 quiesce 之后仍可用（`quiescing --register--> active`） | 无需改动，加了测试 |
+| 拒绝新请求 | 已验证 | `Quiesce` 先把 phase 置 `PhaseQuiescing`，之后 `Provider()` 返回 false，`quota.fetch` / `quota.describe` / `quota.reset` 都回 `plugin_quiesced`。`TestFetchAfterQuiesceIsRefusedWithAClearError` 钉住 |
+| **等手上的采集中止** | **部分验证，不是无条件屏障** | 见下面「合作取消已验证、无界阻塞未证明」一节 |
+| 释放连接池 | **未证明** | 当前只有占位实现，插件不持有自己的连接池，`drain` 不是关闭池。采集走 CPA 注入的 transport（#3）；那些连接的归属与释放在 #3，本票不能声称覆盖。**不要**把这条读成「已满足」 |
+| 推理请求不受影响 | 已验证（正常热替换场景） | 插件的 16 个真实 ABI 推理/执行器方法在 active、quiescing、stopped 三态都回 `unknown_method`；另有 40 秒长流跨替换的实测。**不能**外推到 drain 超时场景 |
+| quiesce 后能恢复 | 已验证（插件侧） | `Register` 在 quiesce 之后仍可用（`quiescing --register--> active`），`TestRollbackRegisterAfterQuiesceServesAgain` 覆盖 |
 
-### 为什么 drain 上限是 5 秒，而不是无限等
+### 合作取消已验证、无界阻塞未证明（评审 R2）
 
-一次采集本身被 `ollama.DefaultTimeout`（20 秒）兜住，取消是协作式的，所以正常
-情况下从"发取消"到"release 跑完"只差一个收尾的距离。真要无限等，一个不理会取消的
-采集就会把热替换永远卡住——那比"quiesce 返回后还有个收尾没跑完"更糟。5 秒明显大于
-正常收尾所需，又远小于任何宿主侧的卸载超时；超时后 quiesce 照常返回（宿主会继续
-卸载），这是有意的取舍，不是遗漏。
+精确地说，本票证明的和没证明的分开是：
+
+- **已验证**：一个遵守取消的采集，在 `Quiesce` 返回前一定已经跑完 `release`。
+  `TestQuiesceWaitsForInFlightFetch` 直接断言这一点，`TestCleanQuiesceEnvelopeIsSuccess`
+  断言这种情况下 RPC 回的是普通成功。
+- **未证明**：一个**不理会**取消的采集。`drain` 5 秒后放弃，此时
+  `TestQuiesceTimeoutIsObservable` / `TestQuiesceTimeoutSurfacesAsErrorEnvelope`
+  断言超时被**观察到**：`State.LastDrain()` 记录 `TimedOut=true, InFlight=N`，
+  RPC 返回 `ok:false` + code `quiesce_drain_timeout` + `detail.in_flight`。
+  **但宿主仍会卸载插件**：CPA v8.0.47 的 `callQuiesce` 不看 quiesce 的返回，
+  换版本照常继续。所以「quiesce 返回时所有采集都结束了」这句**不成立**，
+  本票不这样写。
+
+要让宿主在有在途采集时拒绝替换，必须改 CPA（本票硬边界之外），另立票。
+
+### 为什么 drain 上限是 5 秒
+
+一次采集本身被 `ollama.DefaultTimeout`（20 秒）兜住，取消是协作式的，所以正常情况下
+从「发取消」到「release 跑完」只差一个收尾的距离；5 秒明显大于正常收尾所需，又远小于
+任何宿主侧的卸载超时。**这个上限不是屏障证明**，它只是把「永久卡住」换成「有界等待 +
+可观察的未完成」。超时后 quiesce 照常返回是刻意的：卡死比「已知未完成」更糟。
 
 ### 没做、交回协调者的
 
 下面几条**故意没在本票动**，因为会改 #1 的对外契约或要碰 #3 的文件：
 
-1. **quiesce 返回值的语义。** `Quiesce()` 目前返回"调用前的 phase"，不是"是否
-   drain 干净"。如果要让宿主知道 drain 超时了，得改返回值或加日志；这属于 #1 的接口，
-   由协调者决定。
+1. **quiesce 的返回值语义保持 #1 原样。** `Quiesce()` 仍返回「调用前的 phase」。
+   drain 结果走独立的 `State.LastDrain()` + RPC 错误 envelope，不侵占 #1 的契约；
+   要让宿主据此拒绝替换，需要改 CPA，已记入上面的边界说明。
 2. **`Register` 在 drain 未完成时是否该拒绝。** 本票试过加 `ErrDraining`，结果
    打破了 #1 明写并测试过的 `quiescing --register--> active` 迁移
    （`TestQuiesceAndRegisterCannotInterleave` 断言 quiesce 期间 register 要成功）。
@@ -242,13 +276,50 @@ SPEC 4.1 要求：收到 quiesce 后**拒绝新请求、等手上的采集中止
    脚本没加，是因为本机是 Windows + Docker Desktop，而给 Linux 加的 flag 在
    Desktop 上也没坏处——如果协调者希望脚本在 Linux CI 也能直接跑，这一行要补。
 
+## 安全前置与反向验证（评审 R1 / R3 / R4 / R5 的修复）
+
+脚本最重要的性质是**它不做什么**。那些性质只在拒绝路径和中断路径上执行，
+平时跑一次成功是碰不到的，所以另有一份替身验证：
+`scripts/verify-hotswap-guards.sh`（不连真实 Docker，用记录型 `docker` 替身）。
+
+| 性质 | 怎么保证的 | 替身验证 |
+|---|---|---|
+| 拒绝路径不删任何容器 | 所有前置检查都在第一个 `docker run` 之前；`OWNED_CPA_ID` / `OWNED_UPSTREAM_ID` 只在真正启动后才有值，清理只按这两个 **ID** | 同名容器、端口被占、挂载重合三种拒绝，都是退出 1 且 `docker rm` 调用数 **0** |
+| 清理只删自己创建的 | `docker run -d` 的输出存成容器 ID，`cleanup` 只 `docker rm -f <ID>`，从不按名字 | 直接跑抽出来的 `cleanup`：给出两个 ID 时正好删这两个；不给 ID 时 `docker rm` 调用数 0 |
+| 构建不改工作区源码 | 构建在 `mktemp -d` 的**副本**里做（`stage_build_tree`），`plugin.go` 在副本里盖章 | 脚本内有构建后断言；替身验证还核对 `plugin.go` 与提交版本逐字节相同 |
+| 挂载不重合 | 前置检查读所有运行中容器的 `Mounts[].Source`，与临时目录比相等/祖先/后代 | 替身返回一个挂载父目录的容器 → 退出 1、`docker rm` 0 次、**没有启动任何容器** |
+| 短流不给验收结论 | `HOTSWAP_STREAM_SECONDS < 31` 直接拒绝（除非 `--debug`）；结尾用**实测**耗时断言 > 30 秒 | 6 秒流 → 退出 1，输出里没有任何 `PASS  hot swap verified` 行 |
+
+复跑替身验证：
+
+```sh
+scripts/verify-hotswap-guards.sh      # 18 项全 PASS 才退出 0，全程不碰真实 Docker
+```
+
+**说明「拒绝即无影响」的证据边界**：替身证明的是**脚本调用了什么 Docker 命令**——
+拒绝路径上没有任何 `rm`，因此不可能删掉别人的容器。它不能证明真实 Docker 的其它
+副作用（本机替身不执行真实容器），但脚本在拒绝路径上根本没有开始任何容器，这一点
+由调用记录直接可见。
+
+### 退出时删临时目录的例外
+
+断言失败时脚本会 `KEEP=1` 保留临时目录（诊断需要），所以**不是**所有退出路径都删目录；
+容器始终按 ID 删除。这条例外是有意的，不要读成「所有退出都清理干净」。
+
 ## 怎么复跑
 
 ```sh
-scripts/verify-hotswap.sh            # 跑一遍，PASS 则退出码 0
-scripts/verify-hotswap.sh --keep     # 保留临时目录供排查
+scripts/verify-hotswap.sh                 # 验收跑：请求必须实测 >30s，PASS 则退出码 0
+scripts/verify-hotswap.sh --keep          # 保留临时目录供排查
+scripts/verify-hotswap.sh --debug         # 短流程调试：绝不打印 PASS
 scripts/verify-hotswap.sh --timeout 300   # 把请求上限放宽到 5 分钟
+scripts/verify-hotswap-guards.sh          # 反向验证（替身，不碰真实 Docker）
 ```
+
+**「脚本 PASS」到底证明了什么**：它证明请求**实测**跨过了 >30 秒（脚本自己记的开始/结束
+时间戳），替换发生在请求进行中，响应完整，PID / StartedAt / RestartCount 不变，
+新版本生效，且日志里没有 quiesce drain 超时。短于 31 秒的配置会被拒绝，`--debug`
+跑得再干净也只打印 `DEBUG RUN OK`，不会给验收结论。
 
 换端口（比如 18999 被占）：
 

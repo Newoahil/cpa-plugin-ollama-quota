@@ -11,12 +11,17 @@ import (
 )
 
 // SPEC 4.1 says quiesce must "wait for the collection in hand to abort", not
-// just send the cancel and return. The host dlcloses the library once
-// plugin.quiesce succeeds, so a fetch still executing past that point would run
-// code from an unloaded object. These tests pin that Quiesce is a barrier.
+// just send the cancel and return. What this ticket can honestly claim is
+// narrower than "the barrier holds": the cooperative-cancel path is verified,
+// and a fetch that ignores cancellation is cut off by a bounded wait whose
+// timeout is observable. The host still unloads after a timed-out drain (CPA
+// v8.0.47 ignores the quiesce result), so the barrier is NOT unconditional.
+// These tests pin exactly that: success on the cooperative path, and a visible
+// DrainReport on the timeout path.
 
-// TestQuiesceWaitsForInFlightFetch is the direct assertion: a tracked fetch
-// that needs time to wind down must be finished by the time Quiesce returns.
+// TestQuiesceWaitsForInFlightFetch is the direct assertion on the cooperative
+// path: a tracked fetch that needs time to wind down must be finished by the
+// time Quiesce returns, and the drain is reported as clean.
 func TestQuiesceWaitsForInFlightFetch(t *testing.T) {
 	state := NewState()
 	if _, err := state.Register([]byte(enabledConfig)); err != nil {
@@ -51,12 +56,15 @@ func TestQuiesceWaitsForInFlightFetch(t *testing.T) {
 	if !finished {
 		t.Fatal("Quiesce returned while the tracked fetch was still winding down")
 	}
+	if report := state.LastDrain(); report.TimedOut {
+		t.Fatalf("a cooperative fetch must drain cleanly, got %+v", report)
+	}
 }
 
-// TestQuiesceReturnsWhenFetchIgnoresCancellation pins the bound: a fetch that
-// never honours cancellation must not wedge a hot swap. The drain gives up after
-// drainTimeout and Quiesce still returns.
-func TestQuiesceReturnsWhenFetchIgnoresCancellation(t *testing.T) {
+// TestQuiesceTimeoutIsObservable is the R2 assertion. A fetch that ignores
+// cancellation makes the drain time out, and that timeout must be recorded on
+// the State and surface as a distinguishable error envelope — not swallowed.
+func TestQuiesceTimeoutIsObservable(t *testing.T) {
 	state := NewState()
 	if _, err := state.Register([]byte(enabledConfig)); err != nil {
 		t.Fatalf("register: %v", err)
@@ -65,15 +73,11 @@ func TestQuiesceReturnsWhenFetchIgnoresCancellation(t *testing.T) {
 	if !ok {
 		t.Fatal("provider unavailable")
 	}
-	releaseStuck := make(chan struct{})
 	_, release, tracked := provider.Track(nil)
 	if !tracked {
 		t.Fatal("tracking must be available")
 	}
-	defer func() {
-		close(releaseStuck)
-		release()
-	}()
+	defer release()
 
 	started := time.Now()
 	state.Quiesce()
@@ -85,9 +89,72 @@ func TestQuiesceReturnsWhenFetchIgnoresCancellation(t *testing.T) {
 	if elapsed > drainTimeout+3*time.Second {
 		t.Fatalf("Quiesce took %v; the drain bound is not holding", elapsed)
 	}
+	report := state.LastDrain()
+	if !report.TimedOut {
+		t.Fatalf("a fetch that ignored cancellation must record a timed-out drain, got %+v", report)
+	}
+	if report.InFlight != 1 {
+		t.Errorf("InFlight = %d, want 1", report.InFlight)
+	}
+	if report.Timeout != drainTimeout {
+		t.Errorf("Timeout = %v, want %v", report.Timeout, drainTimeout)
+	}
 	// The instance is quiescing and refuses new work regardless.
 	if _, ok := state.Provider(); ok {
 		t.Fatal("provider must be refused after quiesce")
+	}
+}
+
+// TestQuiesceTimeoutSurfacesAsErrorEnvelope is the RPC half of the same claim:
+// the host-visible response carries a stable code and the in-flight count, so a
+// timed-out drain cannot be mistaken for a clean one.
+func TestQuiesceTimeoutSurfacesAsErrorEnvelope(t *testing.T) {
+	h := newRegisteredHandler(t)
+	provider, ok := h.state.Provider()
+	if !ok {
+		t.Fatal("provider unavailable")
+	}
+	_, release, tracked := provider.Track(nil)
+	if !tracked {
+		t.Fatal("tracking must be available")
+	}
+	defer release()
+
+	raw, err := h.Handle(pluginabi.MethodPluginQuiesce, nil)
+	if err != nil {
+		t.Fatalf("quiesce: %v", err)
+	}
+	envelope := decodeEnvelope(t, raw)
+	if envelope.OK {
+		t.Fatal("a timed-out drain must not report unconditional success")
+	}
+	if envelope.Error == nil {
+		t.Fatal("missing error")
+	}
+	if envelope.Error.Code != DrainTimeoutCode {
+		t.Errorf("code = %q, want %q", envelope.Error.Code, DrainTimeoutCode)
+	}
+	if envelope.Error.Message == "" {
+		t.Error("the timeout must carry a message")
+	}
+	if got := envelope.Error.Detail["in_flight"]; got != float64(1) {
+		t.Errorf("detail.in_flight = %v, want 1", got)
+	}
+	if phase := h.state.Phase(); phase != PhaseQuiescing {
+		t.Errorf("phase = %s; the timeout must not undo the phase change", phase)
+	}
+}
+
+// TestCleanQuiesceEnvelopeIsSuccess pins the other side: a drain that completed
+// must stay a plain success, so the timeout code means what it says.
+func TestCleanQuiesceEnvelopeIsSuccess(t *testing.T) {
+	h := newRegisteredHandler(t)
+	raw, err := h.Handle(pluginabi.MethodPluginQuiesce, nil)
+	if err != nil {
+		t.Fatalf("quiesce: %v", err)
+	}
+	if envelope := decodeEnvelope(t, raw); !envelope.OK {
+		t.Fatalf("a clean quiesce must succeed, got %+v", envelope.Error)
 	}
 }
 

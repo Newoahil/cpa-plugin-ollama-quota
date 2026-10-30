@@ -6,10 +6,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
+
+// DrainTimeoutCode is the error code lifecycleEnvelope reports when quiesce or
+// shutdown gave up waiting for tracked fetches. It is a stable, greppable value:
+// CPA logs a failed quiesce, and the plugin's own tests assert this code.
+const DrainTimeoutCode = "quiesce_drain_timeout"
 
 // Envelope is the RPC frame the host decodes for every plugin call.
 type Envelope struct {
@@ -21,9 +27,10 @@ type Envelope struct {
 // EnvelopeError reports a failed call. Message must never contain credential
 // material.
 type EnvelopeError struct {
-	Code      string `json:"code"`
-	Message   string `json:"message"`
-	Retryable bool   `json:"retryable,omitempty"`
+	Code      string         `json:"code"`
+	Message   string         `json:"message"`
+	Retryable bool           `json:"retryable,omitempty"`
+	Detail    map[string]any `json:"detail,omitempty"`
 }
 
 // IdentifierResponse is the shape the host decodes for *.identifier methods.
@@ -51,7 +58,49 @@ type RegistrationCapable struct {
 	QuotaProvider bool `json:"quota_provider"`
 }
 
-// Handler dispatches RPC methods against one plugin instance.
+// lifecycleEnvelope answers plugin.quiesce / plugin.shutdown. A completed drain
+// is a plain success envelope. A timed-out drain is reported as an error with a
+// stable code and a machine-readable detail, so the timeout is observable even
+// though the phase transition itself did happen.
+//
+// CPA v8.0.47 ignores the success flag of plugin.quiesce (host.go callQuiesce
+// discards the bool), so this envelope does NOT stop the host from unloading.
+// What it buys is honesty and a greppable code (`quiesce_drain_timeout`) in the
+// plugin response and the host's warning log; making the host refuse the swap
+// needs a CPA change, which is out of scope for this ticket.
+func (h *Handler) lifecycleEnvelope(report DrainReport) ([]byte, error) {
+	if !report.TimedOut {
+		return OKEnvelope(LifecycleResponse{})
+	}
+	raw, errMarshal := json.Marshal(Envelope{Error: &EnvelopeError{
+		Code:      DrainTimeoutCode,
+		Message:   drainTimeoutMessage(report),
+		Retryable: false,
+		Detail: map[string]any{
+			"in_flight": report.InFlight,
+			"timeout_s": report.Timeout.Seconds(),
+		},
+	}})
+	if errMarshal != nil {
+		// The frame is all strings and numbers; falling back to the error
+		// envelope without detail is still better than a panic in the host.
+		return ErrorEnvelope(DrainTimeoutCode, drainTimeoutMessage(report)), nil
+	}
+	return raw, nil
+}
+
+// drainTimeoutMessage names the condition without any credential material and
+// without claiming the instance is busy: by this point it is already quiescing.
+func drainTimeoutMessage(report DrainReport) string {
+	return fmt.Sprintf(
+		"quiesce drain timed out with %d quota fetch(es) still running after %s; "+
+			"the instance no longer accepts work, but those fetches were not confirmed finished",
+		report.InFlight, report.Timeout)
+}
+
+// LifecycleResponse is the result of a successful plugin.quiesce / shutdown.
+type LifecycleResponse struct{}
+
 type Handler struct {
 	state *State
 	// ctx is the parent for RPC work. The C ABI carries no context, so
@@ -85,10 +134,10 @@ func (h *Handler) Handle(method string, request []byte) ([]byte, error) {
 		return h.handleRegister(request)
 	case pluginabi.MethodPluginQuiesce:
 		h.state.Quiesce()
-		return OKEnvelope(struct{}{})
+		return h.lifecycleEnvelope(h.state.LastDrain())
 	case pluginabi.MethodPluginShutdown:
 		h.state.Shutdown()
-		return OKEnvelope(struct{}{})
+		return h.lifecycleEnvelope(h.state.LastDrain())
 	case pluginabi.MethodQuotaIdentifier:
 		return OKEnvelope(IdentifierResponse{Identifier: QuotaIdentifier})
 	case pluginabi.MethodQuotaDescribe:

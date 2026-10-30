@@ -74,6 +74,10 @@ type State struct {
 	provider    *Provider
 	config      Config
 	collectStop context.CancelFunc
+	// drain is the outcome of the most recent quiesce/shutdown drain. It is
+	// only read by the RPC layer so a timed-out drain can be reported rather
+	// than swallowed; it is not part of the lifecycle contract.
+	drain DrainReport
 }
 
 // NewState returns a state ready for its first register call.
@@ -110,10 +114,11 @@ func (s *State) Register(configYAML []byte) (Config, error) {
 // The phase change and the provider cancellation happen under one lock. The
 // collector stop is taken under the lock and invoked after it is released.
 //
-// After the cancellation, Quiesce waits for tracked fetches to finish, so that
-// by the time it returns nothing of ours is still executing — the host dlcloses
-// the library right after a successful quiesce (SPEC 4.1). The wait is bounded
-// so a fetch that ignores cancellation cannot wedge a hot swap forever.
+// After the cancellation, Quiesce waits (bounded) for tracked fetches to finish.
+// The bound makes a hot swap impossible to wedge on a fetch that ignores
+// cancellation; it does NOT prove that nothing is still running when quiesce
+// returns. The outcome is available from LastDrain so the RPC layer can report a
+// timeout instead of silently claiming the barrier held.
 func (s *State) Quiesce() Phase {
 	s.mu.Lock()
 	previous := s.phase
@@ -130,7 +135,8 @@ func (s *State) Quiesce() Phase {
 	if stop != nil {
 		stop()
 	}
-	provider.drain(drainTimeout)
+	report := provider.drain(drainTimeout)
+	s.recordDrain(report)
 	return previous
 }
 
@@ -150,7 +156,24 @@ func (s *State) Shutdown() {
 	if stop != nil {
 		stop()
 	}
-	provider.drain(drainTimeout)
+	s.recordDrain(provider.drain(drainTimeout))
+}
+
+// recordDrain stores the most recent drain outcome for the RPC layer to read.
+func (s *State) recordDrain(report DrainReport) {
+	s.mu.Lock()
+	s.drain = report
+	s.mu.Unlock()
+}
+
+// LastDrain returns the outcome of the most recent quiesce or shutdown drain.
+// It is what lets the RPC layer tell the host "quiesce completed but N fetches
+// outlived the bound" instead of reporting an unconditional success. The zero
+// value means no drain has run on this instance.
+func (s *State) LastDrain() DrainReport {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.drain
 }
 
 // takeCollectorLocked detaches the collector stop function so it is called

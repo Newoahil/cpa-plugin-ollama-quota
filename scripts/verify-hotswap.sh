@@ -3,16 +3,23 @@
 # swap the plugin file to v2 mid-stream, and prove the request finishes intact
 # while the CPA process keeps its PID.
 #
-#   scripts/verify-hotswap.sh                # build both versions, run, report
+#   scripts/verify-hotswap.sh                # full acceptance run (request > 30s)
 #   scripts/verify-hotswap.sh --keep         # keep the temp dir for inspection
+#   scripts/verify-hotswap.sh --debug        # short plumbing run, NEVER prints PASS
 #   scripts/verify-hotswap.sh --timeout 180  # bound the streaming request (s)
 #
-# This script never touches a running CPA. It refuses to start when the fixed
-# test port is taken, when a container with its name already exists, or when its
-# temp directory is not brand new; and it deletes its containers and temp
-# directory on every exit path.
+# What PASS means: the script only prints `PASS` after asserting, from its own
+# measured start/end timestamps, that the streaming request actually ran longer
+# than 30 seconds. A shorter run cannot produce an acceptance verdict; use
+# --debug for a fast plumbing check, which prints neither PASS nor "verified".
 #
-# Requires docker, curl and python3 (stdlib only). No Go on the host: both plugin
+# This script never touches a running CPA. Ownership is by container ID: only a
+# container this run created (its ID was printed by this run's `docker run`) is
+# ever removed. Every preflight refusal exits before any container exists, so a
+# refusal performs no Docker mutation at all (see scripts/verify-hotswap-guards.sh,
+# which proves that with a recording docker stand-in).
+#
+# Requires docker, curl and python3 (stdlib only). No Go on the host: the plugin
 # versions and the fake upstream are built in golang:1.26-bookworm.
 #
 # Environment knobs: HOTSWAP_PORT, HOTSWAP_UPSTREAM_PORT, HOTSWAP_STREAM_SECONDS,
@@ -22,7 +29,6 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # ---------------------------------------------------------------- identities
-# These are asserted during preflight; do not point them at a real CPA.
 CONTAINER="ollama-hotswap-test"
 UPSTREAM_CONTAINER="ollama-hotswap-upstream"
 PORT="${HOTSWAP_PORT:-18999}"
@@ -33,23 +39,34 @@ MGMT_KEY="hotswap-local-mgmt-key"
 PLUGIN_ID="ollama-quota"
 CLIENT_KEY="hotswap-local-client-key"
 
-# The two versions are derived from the source, not hard-coded, so the script
-# stays correct when the tree's Version changes. v1 is whatever is committed;
-# v2 is a second genuine compile with the patch level bumped by one.
-# Resolved in preflight, once fail() exists and the source file is readable.
-SOURCE_VERSION=""
-V1_VERSION=""
-V2_VERSION=""
+# An acceptance run needs the request to demonstrably outlive 30 seconds, which
+# is the SPEC 4.1 acceptance shape (SPEC 4.1: "发起一个耗时 30 秒以上的推理请求").
+# Anything shorter is plumbing-only and runs under --debug.
+MIN_ACCEPTANCE_SECONDS=31
 STREAM_SECONDS="${HOTSWAP_STREAM_SECONDS:-40}"
 SWAP_AT_SECONDS="${HOTSWAP_SWAP_AT_SECONDS:-8}"
 REQUEST_TIMEOUT=180
 KEEP=0
+DEBUG_ONLY=0
+
+# Container IDs this run created. Empty means the run owns nothing and the
+# cleanup path must not touch Docker at all.
+OWNED_CPA_ID=""
+OWNED_UPSTREAM_ID=""
+
+# Build scratch lives outside the source tree; see build_version.
+BUILD_SRC_DIR=""
+
+SOURCE_VERSION=""
+V1_VERSION=""
+V2_VERSION=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --keep) KEEP=1; shift ;;
+    --debug) DEBUG_ONLY=1; shift ;;
     --timeout) REQUEST_TIMEOUT="${2:-180}"; shift 2 ;;
-    -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -63,6 +80,17 @@ verdict() { # verdict <ok|bad> <label> [detail]
   if [[ "$1" == "ok" ]]; then RESULTS+=("PASS  $2${3:+ — $3}"); else RESULTS+=("FAIL  $2${3:+ — $3}"); fi
 }
 
+# python vs python3 depends on the host; resolve it once. This happens before
+# any preflight so every call site uses the same binary.
+if command -v python >/dev/null 2>&1; then
+  PYTHON="python"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON="python3"
+else
+  printf '\nFAIL: python3 (standard library only) is needed to read JSON and probe ports\n' >&2
+  exit 1
+fi
+
 WORKDIR=""
 CLEANED=0
 cleanup() {
@@ -71,8 +99,21 @@ cleanup() {
   CLEANED=1
   set +e
   log "cleanup"
-  docker rm -f "$CONTAINER" >/dev/null 2>&1 && note "removed container $CONTAINER"
-  docker rm -f "$UPSTREAM_CONTAINER" >/dev/null 2>&1 && note "removed container $UPSTREAM_CONTAINER"
+  # Ownership is by ID, never by name. A preflight refusal leaves both IDs
+  # empty, so this branch does nothing at all on a refusal.
+  if [[ -n "$OWNED_CPA_ID" ]]; then
+    if docker rm -f "$OWNED_CPA_ID" >/dev/null 2>&1; then
+      note "removed the CPA container this run started ($OWNED_CPA_ID)"
+    fi
+  fi
+  if [[ -n "$OWNED_UPSTREAM_ID" ]]; then
+    if docker rm -f "$OWNED_UPSTREAM_ID" >/dev/null 2>&1; then
+      note "removed the upstream container this run started ($OWNED_UPSTREAM_ID)"
+    fi
+  fi
+  if [[ -n "$BUILD_SRC_DIR" && -d "$BUILD_SRC_DIR" ]]; then
+    rm -rf "$BUILD_SRC_DIR" && note "removed build scratch $BUILD_SRC_DIR"
+  fi
   if [[ -n "$WORKDIR" && -d "$WORKDIR" ]]; then
     if [[ $KEEP -eq 1 ]]; then note "kept $WORKDIR (--keep)"; else rm -rf "$WORKDIR" && note "removed $WORKDIR"; fi
   fi
@@ -86,17 +127,6 @@ port_in_use() {
   # live listener as free, and its pipe into grep mangles netstat's output.
   "$PYTHON" scripts/port_in_use.py "$1"
 }
-
-# python vs python3 depends on the host; resolve it once so every call site uses
-# the same binary. This runs before the preflight that would otherwise report it.
-if command -v python >/dev/null 2>&1; then
-  PYTHON="python"
-elif command -v python3 >/dev/null 2>&1; then
-  PYTHON="python3"
-else
-  printf '\nFAIL: python3 (standard library only) is needed to read JSON and probe ports\n' >&2
-  exit 1
-fi
 
 wait_for() { # wait_for <seconds> <command...>
   local limit="$1"; shift
@@ -122,12 +152,11 @@ for entry in json.load(sys.stdin).get("plugins", []):
 }
 
 # ---------------------------------------------------------------- preflight
+# Everything below exits before a single container exists, so a refusal here
+# cannot leave anything behind and cannot remove anything it did not make.
 log "preflight"
 command -v docker >/dev/null 2>&1 || fail "docker is not on PATH"
 command -v curl   >/dev/null 2>&1 || fail "curl is not on PATH"
-if ! command -v python >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
-  fail "python3 (standard library only) is needed to read JSON responses"
-fi
 
 for p in "$PORT" "$UPSTREAM_PORT"; do
   if port_in_use "$p"; then
@@ -136,6 +165,7 @@ FAIL: port $p already has a listener.
     Refusing to start: this script must never share a port with a running CPA
     or anything else. Choose another port with HOTSWAP_PORT=... and
     HOTSWAP_UPSTREAM_PORT=..., or stop whatever holds it.
+    Nothing was started and nothing was removed.
 MSG
     exit 1
   fi
@@ -147,8 +177,11 @@ for c in "$CONTAINER" "$UPSTREAM_CONTAINER"; do
     cat >&2 <<MSG
 FAIL: container $c already exists.
     Refusing to start: a previous run did not clean up, or someone else owns
-    that name. Inspect it; if it is stale, remove it yourself with
+    that name. This script removes containers by ID, and it has no ID for that
+    one, so it will not touch it. Inspect it; if it is stale, remove it
+    yourself with
         docker rm -f $c
+    Nothing was started and nothing was removed.
 MSG
     exit 1
   fi
@@ -164,10 +197,62 @@ V1_VERSION="$SOURCE_VERSION"
 V2_VERSION="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))"
 note "plugin versions: v$V1_VERSION (committed) -> v$V2_VERSION (second build)"
 
+# Accepting a short stream would let the script print an acceptance PASS for a
+# request that never outlived 30 seconds, which is not what this ticket claims.
+if ! [[ "$STREAM_SECONDS" =~ ^[0-9]+$ ]]; then
+  fail "HOTSWAP_STREAM_SECONDS must be an integer (got '$STREAM_SECONDS')"
+fi
+if [[ $DEBUG_ONLY -eq 0 && "$STREAM_SECONDS" -lt "$MIN_ACCEPTANCE_SECONDS" ]]; then
+  cat >&2 <<MSG
+FAIL: HOTSWAP_STREAM_SECONDS=$STREAM_SECONDS is too short for an acceptance run.
+    An acceptance run needs a request that outlives 30 seconds
+    (HOTSWAP_STREAM_SECONDS >= $MIN_ACCEPTANCE_SECONDS). For a fast plumbing
+    check that never prints PASS, pass --debug.
+    Nothing was started and nothing was removed.
+MSG
+  exit 1
+fi
+if ! [[ "$SWAP_AT_SECONDS" =~ ^[0-9]+$ ]] || [[ "$SWAP_AT_SECONDS" -ge "$STREAM_SECONDS" ]]; then
+  fail "HOTSWAP_SWAP_AT_SECONDS must be an integer below HOTSWAP_STREAM_SECONDS (got '$SWAP_AT_SECONDS')"
+fi
+if [[ $DEBUG_ONLY -eq 1 ]]; then
+  note "DEBUG MODE: this run proves plumbing only and will not print PASS"
+fi
+
 # mktemp -d creates a fresh directory; assert it rather than assume it.
 WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/ollama-hotswap.XXXXXX")"
 [[ -d "$WORKDIR" && -z "$(ls -A "$WORKDIR")" ]] || fail "temp dir $WORKDIR is not new and empty"
 note "temp dir $WORKDIR is new"
+
+# A brand-new directory is not on its own proof that no running CPA can see it:
+# if a CPA has a parent directory bind-mounted, a fresh temp dir inside it is
+# visible to that CPA. Compare against every running container's mount sources
+# and refuse on any equality, ancestor, or descendant overlap. This is read-only:
+# it inspects, and never touches those containers.
+if docker ps -q 2>/dev/null | grep -q .; then
+  mapfile -t running_ids < <(docker ps -q)
+  inspect_fmt='{{.Name}}|{{range .Mounts}}{{.Source}}|{{end}}'
+  mount_overlap="$(
+    docker inspect --format "$inspect_fmt" "${running_ids[@]}" 2>/dev/null \
+      | "$PYTHON" scripts/mount_overlap.py "$WORKDIR" "$(host_path "$WORKDIR")" || true
+  )"
+  if [[ -n "$mount_overlap" ]]; then
+    {
+      printf '\nFAIL: the temp tree overlaps an existing container'"'"'s bind mount.\n'
+      printf '    Refusing to start: a running container can already see inside\n'
+      printf '    %s, so this test instance would not be isolated.\n' "$WORKDIR"
+      printf '    Overlapping mount(s):\n'
+      printf '%s\n' "$mount_overlap" | sed 's/^/      /'
+      printf '    Choose a different location (for example a TMPDIR outside any\n'
+      printf '    mounted tree). Nothing was started and nothing was removed.\n'
+    } >&2
+    exit 1
+  fi
+  note "no running container mounts a tree containing $WORKDIR"
+else
+  note "no running containers; mount overlap cannot apply"
+fi
+
 mkdir -p "$WORKDIR/plugins" "$WORKDIR/auths" "$WORKDIR/build"
 
 for image in "$CPA_IMAGE" "$GO_IMAGE"; do
@@ -262,34 +347,43 @@ MSYS_NO_PATHCONV=1 docker run --rm \
 
 # Version is a Go constant, so v2 is a genuine second compile of the same source
 # with Version changed. The -v<version> filename suffix is what makes CPA treat
-# the new file as an upgrade instead of the same plugin.
+# the new file as an upgrade instead of a plugin with the same identity.
 #
-# plugin.go is stamped in place and restored from a saved copy on every path, so
-# a failed build cannot leave the tree stamped.
-PLUGIN_GO="internal/quotaplugin/plugin.go"
-build_version() { # build_version <version>
-  local version="$1" saved applied
-  saved="$(cat "$PLUGIN_GO")"
-  restore() { printf '%s\n' "$saved" > "$PLUGIN_GO"; }
+# The build happens in a copy of the tree, never in place. Stamping the working
+# copy in place would mean an interrupt (Ctrl-C, a dropped terminal, SIGTERM from
+# a CI timeout) could leave plugin.go at the bumped version, and the next run
+# would silently swap 0.1.3 -> 0.1.4 instead of the version under review.
+PLUGIN_ID_DIRS=(cmd internal go.mod go.sum)
+stage_build_tree() {
+  BUILD_SRC_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hotswap-src.XXXXXX")"
+  local entry
+  for entry in "${PLUGIN_ID_DIRS[@]}"; do
+    cp -R "$entry" "$BUILD_SRC_DIR/"
+  done
+}
 
-  printf '%s\n' "$saved" \
-    | sed -E "s/^([[:space:]]*Version[[:space:]]*=[[:space:]]*)\"0\.[0-9]+\.[0-9]+\"/\1\"$version\"/" \
-    > "$PLUGIN_GO"
-  applied="$(sed -n 's/^[[:space:]]*Version *= *"\([^"]*\)".*$/\1/p' "$PLUGIN_GO" | head -1)"
+build_version() { # build_version <version>
+  local version="$1"
+  local copied_plugin_go="$BUILD_SRC_DIR/internal/quotaplugin/plugin.go"
+  local applied
+
+  sed -E "s/^([[:space:]]*Version[[:space:]]*=[[:space:]]*)\"0\.[0-9]+\.[0-9]+\"/\1\"$version\"/" \
+    "$copied_plugin_go" > "$copied_plugin_go.tmp"
+  mv "$copied_plugin_go.tmp" "$copied_plugin_go"
+  applied="$(sed -n 's/^[[:space:]]*Version *= *"\([^"]*\)".*$/\1/p' "$copied_plugin_go" | head -1)"
   if [[ "$applied" != "$version" ]]; then
-    restore
-    fail "could not stamp Version=$version into $PLUGIN_GO (found '$applied')"
+    fail "could not stamp Version=$version into the build copy (found '$applied')"
   fi
 
   MSYS_NO_PATHCONV=1 docker run --rm \
-    -v "$(host_path "$PWD"):/src" -v "$(host_path "$WORKDIR/build"):/out" -w /src \
+    -v "$(host_path "$BUILD_SRC_DIR"):/src" -v "$(host_path "$WORKDIR/build"):/out" -w /src \
     "$GO_IMAGE" \
     sh -c "mkdir -p /tmp/gocache && export GOCACHE=/tmp/gocache && \
            CGO_ENABLED=1 go build -buildmode=c-shared -o '/out/$PLUGIN_ID-v$version.so' ./cmd/plugin" \
-    || { restore; fail "build of $version failed"; }
-  restore
+    || fail "build of $version failed"
 }
 
+stage_build_tree
 build_version "$V1_VERSION"
 build_version "$V2_VERSION"
 
@@ -299,9 +393,13 @@ done
 if cmp -s "$WORKDIR/build/$PLUGIN_ID-v$V1_VERSION.so" "$WORKDIR/build/$PLUGIN_ID-v$V2_VERSION.so"; then
   fail "v1 and v2 are byte-identical; the swap would not be an upgrade"
 fi
+# The working tree was never stamped: assert that rather than claim it.
+if ! grep -qE "^[[:space:]]*Version[[:space:]]*=[[:space:]]*\"$V1_VERSION\"" internal/quotaplugin/plugin.go; then
+  fail "the working tree's plugin.go is no longer at v$V1_VERSION; the build stamped it in place"
+fi
 note "v1 $(wc -c < "$WORKDIR/build/$PLUGIN_ID-v$V1_VERSION.so" | tr -d ' ') bytes"
 note "v2 $(wc -c < "$WORKDIR/build/$PLUGIN_ID-v$V2_VERSION.so" | tr -d ' ') bytes, differs from v1"
-note "the tree's plugin.go is back to $(sed -n 's/^[[:space:]]*Version *= *"\([^"]*\)".*$/\1/p' "$PLUGIN_GO" | head -1)"
+note "the working tree's plugin.go was never modified (still v$V1_VERSION)"
 
 # The CPA config for this run only. Its plugin dir, auth dir and port are all
 # unique to this temp directory.
@@ -333,33 +431,38 @@ openai-compatibility:
 YAML
 
 # ------------------------------------------------------------------- start
+# From here on the run owns containers, so their IDs are what cleanup removes.
 log "starting the fake upstream on 127.0.0.1:$UPSTREAM_PORT"
-MSYS_NO_PATHCONV=1 docker run -d --rm --name "$UPSTREAM_CONTAINER" \
+OWNED_UPSTREAM_ID="$(MSYS_NO_PATHCONV=1 docker run -d --rm --name "$UPSTREAM_CONTAINER" \
   -p "127.0.0.1:$UPSTREAM_PORT:$UPSTREAM_PORT" \
   -e "ADDR=:$UPSTREAM_PORT" -e "STREAM_SECONDS=$STREAM_SECONDS" \
   -v "$(host_path "$WORKDIR/build"):/fixture:ro" \
-  "$GO_IMAGE" /fixture/upstream >/dev/null || fail "the fake upstream container did not start"
+  "$GO_IMAGE" /fixture/upstream)" || fail "the fake upstream container did not start"
+[[ -n "$OWNED_UPSTREAM_ID" ]] || fail "docker run returned no container ID for the upstream"
+note "upstream container $OWNED_UPSTREAM_ID"
 
 upstream_health() { curl -fsS -m 2 "http://127.0.0.1:$UPSTREAM_PORT/healthz" >/dev/null; }
 if ! wait_for 45 upstream_health; then
-  docker logs "$UPSTREAM_CONTAINER" 2>&1 | tail -20 >&2 || true
+  docker logs "$OWNED_UPSTREAM_ID" 2>&1 | tail -20 >&2 || true
   fail "the fake upstream never became healthy"
 fi
 note "upstream healthy"
 
 log "starting the isolated CPA instance on 127.0.0.1:$PORT"
 cp "$WORKDIR/build/$PLUGIN_ID-v$V1_VERSION.so" "$WORKDIR/plugins/"
-MSYS_NO_PATHCONV=1 docker run -d --rm --name "$CONTAINER" \
+OWNED_CPA_ID="$(MSYS_NO_PATHCONV=1 docker run -d --rm --name "$CONTAINER" \
   -p "127.0.0.1:$PORT:$PORT" \
   -v "$(host_path "$WORKDIR/config.yaml"):/CLIProxyAPI/config.yaml" \
   -v "$(host_path "$WORKDIR/plugins"):/data/plugins" \
   -v "$(host_path "$WORKDIR/auths"):/data/auths" \
-  "$CPA_IMAGE" ./CLIProxyAPI --config /CLIProxyAPI/config.yaml >/dev/null \
+  "$CPA_IMAGE" ./CLIProxyAPI --config /CLIProxyAPI/config.yaml)" \
   || fail "the CPA container did not start"
+[[ -n "$OWNED_CPA_ID" ]] || fail "docker run returned no container ID for CPA"
+note "CPA container $OWNED_CPA_ID"
 
 cpa_health() { curl -fsS -m 3 -H "Authorization: Bearer $MGMT_KEY" "http://127.0.0.1:$PORT/v0/management/plugins" >/dev/null; }
 if ! wait_for 60 cpa_health; then
-  docker logs "$CONTAINER" 2>&1 | tail -30 >&2 || true
+  docker logs "$OWNED_CPA_ID" 2>&1 | tail -30 >&2 || true
   fail "the CPA instance never answered on port $PORT"
 fi
 note "CPA answered"
@@ -385,15 +488,17 @@ fi
 note "model fake-slow-model is routable"
 
 # -------------------------------------------------------------- experiment
-cpa_process() { docker inspect "$CONTAINER" --format '{{.State.Pid}}|{{.State.StartedAt}}|{{.RestartCount}}' 2>/dev/null || true; }
+cpa_process() { docker inspect "$1" --format '{{.State.Pid}}|{{.State.StartedAt}}|{{.RestartCount}}' 2>/dev/null || true; }
 
-before="$(cpa_process)"
+before="$(cpa_process "$OWNED_CPA_ID")"
 [[ -n "$before" ]] || fail "cannot inspect the CPA container"
 BEFORE_PID="${before%%|*}"
 rest="${before#*|}"; BEFORE_STARTED="${rest%%|*}"; BEFORE_RESTARTS="${rest##*|}"
 [[ "$BEFORE_PID" != "0" && -n "$BEFORE_PID" ]] || fail "the CPA process is not running"
 
 log "starting a ${STREAM_SECONDS}s streaming request"
+# Wall clock, not $SECONDS: the acceptance assertion below compares these two
+# values, and a coarser or non-monotonic source would make it approximate.
 REQUEST_START_EPOCH="$(date +%s)"
 REQUEST_STARTED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -419,7 +524,7 @@ if ! kill -0 "$REQUEST_PID" 2>/dev/null; then
   fail "the streaming request ended before the swap, so it proves nothing; raise HOTSWAP_STREAM_SECONDS"
 fi
 
-mid="$(cpa_process)"
+mid="$(cpa_process "$OWNED_CPA_ID")"
 MID_PID="${mid%%|*}"
 note "PID during the request: $MID_PID (before: $BEFORE_PID)"
 
@@ -434,7 +539,7 @@ mgmt -X PATCH -H "Content-Type: application/json" \
 
 swapped_to_v2() { [[ "$(active_version)" == "$V2_VERSION" ]]; }
 if ! wait_for 45 swapped_to_v2; then
-  docker logs "$CONTAINER" 2>&1 | tail -30 >&2 || true
+  docker logs "$OWNED_CPA_ID" 2>&1 | tail -30 >&2 || true
   fail "the plugin never reported v$V2_VERSION"
 fi
 SWAP_CONFIRMED_EPOCH="$(date +%s)"
@@ -448,8 +553,10 @@ note "the request is still streaming across the swap"
 wait "$REQUEST_PID"; REQUEST_STATUS=$?
 REQUEST_END_EPOCH="$(date +%s)"
 REQUEST_ENDED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# Measured, not configured: this is the number the acceptance gate below uses.
+REQUEST_SECONDS=$((REQUEST_END_EPOCH - REQUEST_START_EPOCH))
 
-after="$(cpa_process)"
+after="$(cpa_process "$OWNED_CPA_ID")"
 AFTER_PID="${after%%|*}"
 rest="${after#*|}"; AFTER_STARTED="${rest%%|*}"; AFTER_RESTARTS="${rest##*|}"
 
@@ -465,7 +572,8 @@ final_version="$(active_version)"
 printf '\nrequest timeline (UTC)\n'
 printf '  started         %s\n' "$REQUEST_STARTED_UTC"
 printf '  swap confirmed  +%ss\n' "$((SWAP_CONFIRMED_EPOCH - REQUEST_START_EPOCH))"
-printf '  ended           %s (after %ss)\n' "$REQUEST_ENDED_UTC" "$((REQUEST_END_EPOCH - REQUEST_START_EPOCH))"
+printf '  ended           %s\n' "$REQUEST_ENDED_UTC"
+printf '  measured        %ss (the acceptance gate needs >30s)\n' "$REQUEST_SECONDS"
 printf '  response        %s bytes, %s/%s distinct tokens\n' "$body_bytes" "$tokens_seen" "$STREAM_SECONDS"
 printf '\nCPA process\n'
 printf '  PID           before=%s  mid=%s  after=%s\n' "$BEFORE_PID" "$MID_PID" "$AFTER_PID"
@@ -491,6 +599,17 @@ printf '\n'
        "started ${REQUEST_STARTED_UTC}, swap at +$((SWAP_CONFIRMED_EPOCH - REQUEST_START_EPOCH))s, ended ${REQUEST_ENDED_UTC}" \
   || verdict bad "the request spanned the swap" "it does not straddle the swap"
 
+# The acceptance gate itself: measured wall clock, not the configured length.
+# Under --debug a short run is the point, so the gate is reported as SKIP: it is
+# not a passing verdict, and it does not mask a real plumbing failure either.
+if [[ $DEBUG_ONLY -eq 1 ]]; then
+  RESULTS+=("SKIP  the request outlived 30 seconds — not applicable in --debug")
+elif [[ "$REQUEST_SECONDS" -gt 30 ]]; then
+  verdict ok "the request outlived 30 seconds" "measured ${REQUEST_SECONDS}s"
+else
+  verdict bad "the request outlived 30 seconds" "measured only ${REQUEST_SECONDS}s"
+fi
+
 [[ "$BEFORE_PID" == "$AFTER_PID" && "$BEFORE_PID" == "$MID_PID" ]] \
   && verdict ok "the CPA process kept its PID" "$BEFORE_PID throughout" \
   || verdict bad "the CPA process kept its PID" "before=$BEFORE_PID mid=$MID_PID after=$AFTER_PID"
@@ -505,11 +624,19 @@ printf '\n'
   || verdict bad "the new plugin version is live" "reports '$final_version'"
 
 CPA_LOG="$WORKDIR/cpa.log"
-docker logs "$CONTAINER" > "$CPA_LOG" 2>&1 || true
+docker logs "$OWNED_CPA_ID" > "$CPA_LOG" 2>&1 || true
 if grep -qiE "plugin hot reloaded.*active_version=$V2_VERSION" "$CPA_LOG"; then
   verdict ok "CPA logged a hot reload, not a reload from scratch" "active_version=$V2_VERSION"
 else
   verdict bad "CPA logged a hot reload, not a reload from scratch" "no 'plugin hot reloaded' line for v$V2_VERSION"
+fi
+# A timed-out quiesce drain must be visible here, not silently accepted. Clean
+# runs must show none; a run that shows one has a real finding to report.
+if grep -qiE 'quiesce drain timed out|quiesce_drain_timeout' "$CPA_LOG"; then
+  drain_timeouts="$(grep -icE 'quiesce drain timed out|quiesce_drain_timeout' "$CPA_LOG" || true)"
+  verdict bad "no quiesce drain timed out" "$drain_timeouts timeout line(s): the barrier did not hold"
+else
+  verdict ok "no quiesce drain timed out" "every quiesce drained within the bound"
 fi
 error_lines="$(grep -icE '\[(error|fatal)\]' "$CPA_LOG" || true)"
 [[ "$error_lines" == "0" ]] && verdict ok "CPA logged no errors" "0 error/fatal lines" \
@@ -531,11 +658,17 @@ for line in "${RESULTS[@]}"; do [[ "$line" == FAIL* ]] && failures=$((failures +
 if [[ $failures -ne 0 ]]; then
   log "diagnostics"
   printf '  cpa log (last 40 lines):\n';        tail -40 "$CPA_LOG" 2>/dev/null | sed 's/^/    /' || true
-  printf '  upstream log (last 20 lines):\n';   docker logs "$UPSTREAM_CONTAINER" 2>&1 | tail -20 | sed 's/^/    /' || true
+  printf '  upstream log (last 20 lines):\n';   docker logs "$OWNED_UPSTREAM_ID" 2>&1 | tail -20 | sed 's/^/    /' || true
   printf '  plugin directory:\n';               ls -la "$WORKDIR/plugins" 2>/dev/null | sed 's/^/    /' || true
   printf '  temp dir kept at %s\n' "$WORKDIR"
   KEEP=1
   fail "$failures assertion(s) failed"
 fi
 
-printf 'PASS  hot swap verified: the request crossed the swap intact, the CPA process kept PID %s, and v%s is live\n' "$BEFORE_PID" "$V2_VERSION"
+if [[ $DEBUG_ONLY -eq 1 ]]; then
+  printf 'DEBUG RUN OK  plumbing works end to end (%ss request), but this is NOT an acceptance verdict:\n' "$REQUEST_SECONDS"
+  printf '              rerun without --debug and with HOTSWAP_STREAM_SECONDS >= %s to produce PASS\n' "$MIN_ACCEPTANCE_SECONDS"
+  exit 0
+fi
+
+printf 'PASS  hot swap verified: a %ss request (measured) crossed the swap intact, the CPA process kept PID %s, and v%s is live\n' "$REQUEST_SECONDS" "$BEFORE_PID" "$V2_VERSION"
