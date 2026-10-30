@@ -85,7 +85,13 @@ func (c *collector) sweepOnceSafely(ctx context.Context) (refreshed, failed int,
 	}()
 
 	bridge := c.provider.bridge()
-	entries, errList := bridge.listAuths(ctx)
+	// The enumeration is bounded by the same per-attempt budget as a collection:
+	// it is host code that can block, and it runs before any fetch, so an
+	// unbounded host.auth.list would hold the sweep — and therefore quiesce —
+	// forever (P2-1).
+	listBudget, cancelList := context.WithTimeout(ctx, c.provider.attemptTimeout())
+	entries, errList := bridge.listAuths(listBudget)
+	cancelList()
 	if errList != nil {
 		// The bridge's own message names the callback, never a credential.
 		c.safeLog(ctx, "warning", "the Ollama quota collector could not list credentials: "+errList.Error())

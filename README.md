@@ -135,8 +135,24 @@ scripts/build.sh --go               # 用本机的 Go 和 C 工具链编译当�
    进程不重启；之后的额度页里不再有 Ollama 行。**注意这条命令会把 `plugins.configs.ollama-quota`
    从 `config.yaml` 里删掉**，想重新装回来要再把上面那段加回去。
 
-> 当前版本 0.1.2 是骨架：额度数字是固定样例（一个 5 小时窗口、已用 50%、余额 $10.00），
-> 真实采集在 #2 补。`POST /v0/management/quota/fetch` 返回样例数据，`reset` 一律返回"不支持"。
+> 当前版本 0.1.2 已接真实采集：凭证里的 `api_key` 走 `GET https://ollama.com/api/balance`，
+> 只有 `cookie` 时走 `GET https://ollama.com/settings` 解析 HTML；两条都失败时返回上一次成功读到的
+> 数字并标「已过期」，从没成功过则返回错误、不带数字。插件按 `interval_seconds`（默认 900 秒）
+> 定时采集，也能被 CPA 的额度页刷新按钮触发。
+>
+> `reset` 一律返回"不支持"——Ollama 没有重置额度的接口。
+>
+> 凭证字段：`{"type":"ollama","api_key":"..."}` 或 `{"type":"ollama","cookie":"..."}`，
+> 两者都在凭证 JSON 顶层；两种都配时优先 API Key（见 `internal/quotaplugin/credential.go`）。
+>
+> **已知未满足的约束（SPEC 4.2）**：要求凭证只发往固定的 `ollama.com`。插件把请求 URL 钉成
+> 编译期常量，并拒绝自己看到的任何 3xx；但 CPA 宿主那个 HTTP 客户端**会跟随重定向**
+> （`internal/pluginhost/http_bridge.go` 的 `CheckRedirect`），且 `HTTPResponse` 不回传最终 URL。
+> Go 的 `http.Client` 在跟随重定向时，对**跨任意域**会删除 `Authorization` / `Cookie`，
+> 但对**同域与子域**（`shouldCopyHeaderOnRedirect`，例如 `sub.ollama.com`）**会保留**。
+> 所以残余的、插件无法察觉也无法撤销的风险是**子域转发**：凭证可能被送到 ollama.com 的子域。
+> 插件无法在事后发现或补救，**这条要改宿主才能根治，需另立 CPA 票**；在宿主修好之前，
+> 本插件不满足 SPEC 4.2 的严格要求。
 
 ## 文档
 

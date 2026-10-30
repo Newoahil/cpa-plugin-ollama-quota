@@ -69,6 +69,21 @@ type fixtureHost struct {
 	panicOnHTTP bool
 	// panicOnListAuths makes host.auth.list panic.
 	panicOnListAuths bool
+	// panicOnCancel makes host.http.cancel panic (P1-a).
+	panicOnCancel bool
+	// authListBlock, when non-nil, parks host.auth.list until it is closed. The
+	// real host callback is synchronous and has no operation to cancel, so a
+	// plain block is the honest model of a wedged host (P2-1).
+	authListBlock chan struct{}
+	// authListEntered is closed once host.auth.list has been entered and is
+	// parked, so a test can act only after the call is provably in progress.
+	authListEntered chan struct{}
+	// cancelEntered / cancelRelease let a test hold the cancel callback inside
+	// the host while it checks the quiesce barrier (P1-b).
+	cancelEntered chan struct{}
+	cancelRelease chan struct{}
+	// authGetBlock, when non-nil, parks host.auth.get until it is closed (P2-1).
+	authGetBlock chan struct{}
 }
 
 // settingsHTML is a settings page the #2 parser understands: a session window
@@ -100,6 +115,21 @@ func (f *fixtureHost) call(_ context.Context, method string, request []byte) ([]
 		if f.panicOnListAuths {
 			panic("fixture: host.auth.list panicked")
 		}
+		if f.authListBlock != nil {
+			entered := f.authListEntered
+			block := f.authListBlock
+			f.mu.Unlock()
+			if entered != nil {
+				select {
+				case <-entered:
+				default:
+					close(entered)
+				}
+			}
+			<-block
+			f.mu.Lock()
+			return nil, fmt.Errorf("host.auth.list: released")
+		}
 		if f.authListErr != nil {
 			return nil, f.authListErr
 		}
@@ -113,6 +143,20 @@ func (f *fixtureHost) call(_ context.Context, method string, request []byte) ([]
 		}
 		if err := json.Unmarshal(request, &req); err != nil {
 			return nil, err
+		}
+		if f.authGetBlock != nil {
+			block := f.authGetBlock
+			f.mu.Unlock()
+			<-block
+			f.mu.Lock()
+			return nil, fmt.Errorf("host.auth.get: released")
+		}
+		if f.authGetBlock != nil {
+			block := f.authGetBlock
+			f.mu.Unlock()
+			<-block
+			f.mu.Lock()
+			return nil, fmt.Errorf("host.auth.get: released")
 		}
 		stored, ok := f.storages[req.AuthIndex]
 		if !ok {
@@ -129,6 +173,39 @@ func (f *fixtureHost) call(_ context.Context, method string, request []byte) ([]
 
 	case pluginabi.MethodHostHTTPCancel:
 		f.cancels++
+		// Abort the blocked exchange first, the way a real host cancel does.
+		// The panic then models a defect after the abort, which is the case the
+		// plugin has to survive (P1-a): the request itself is already finished,
+		// so nothing should be waiting on this callback.
+		if f.block != nil {
+			select {
+			case <-f.block:
+			default:
+				close(f.block)
+			}
+		}
+		if f.panicOnCancel {
+			// Deliberately panics with a value that looks like a secret: the
+			// plugin must not put it anywhere (P1-a / SPEC 4.2).
+			panic("fixture-cancel-panic-canary-CANCELSECRET-77")
+		}
+		if f.cancelEntered != nil {
+			entered := f.cancelEntered
+			release := f.cancelRelease
+			f.mu.Unlock()
+			select {
+			case <-entered:
+			default:
+				close(entered)
+			}
+			// The exchange was already released above; park the callback inside
+			// the host to model the P1-b race.
+			if release != nil {
+				<-release
+			}
+			f.mu.Lock()
+			return okResult(struct{}{})
+		}
 		// Releasing the blocker is what a real cancel does: the in-flight
 		// exchange returns immediately.
 		if f.block != nil {
@@ -243,6 +320,78 @@ func (f *fixtureHost) setPanicOnListAuths(value bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.panicOnListAuths = value
+}
+
+// setPanicOnCancel makes host.http.cancel panic.
+func (f *fixtureHost) setPanicOnCancel(value bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.panicOnCancel = value
+}
+
+// setAuthListBlock parks host.auth.list until the returned function is called.
+// It also returns a channel that closes once the call is inside the block.
+func (f *fixtureHost) setAuthListBlock() (release func(), entered <-chan struct{}) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.authListBlock = make(chan struct{})
+	f.authListEntered = make(chan struct{})
+	block := f.authListBlock
+	return func() {
+		select {
+		case <-block:
+		default:
+			close(block)
+		}
+	}, f.authListEntered
+}
+
+// setAuthGetBlock parks host.auth.get until the returned function is called.
+func (f *fixtureHost) setAuthGetBlock() (release func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.authGetBlock = make(chan struct{})
+	block := f.authGetBlock
+	return func() {
+		select {
+		case <-block:
+		default:
+			close(block)
+		}
+	}
+}
+
+// setBlockCleared releases a blocker installed by setBlock and removes it, so a
+// later callback takes the normal path.
+func (f *fixtureHost) setBlockCleared() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.block != nil {
+		select {
+		case <-f.block:
+		default:
+			close(f.block)
+		}
+	}
+	f.block = nil
+}
+
+// setCancelHold parks the host.http.cancel callback inside the host. It returns
+// a channel that closes once the callback is inside, and the release function
+// the test calls to let it finish.
+func (f *fixtureHost) setCancelHold() (entered <-chan struct{}, release func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cancelEntered = make(chan struct{})
+	f.cancelRelease = make(chan struct{})
+	releaseCh := f.cancelRelease
+	return f.cancelEntered, func() {
+		select {
+		case <-releaseCh:
+		default:
+			close(releaseCh)
+		}
+	}
 }
 
 // setBlock installs a blocker that parks every HTTP callback until it is closed

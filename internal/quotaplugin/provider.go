@@ -132,6 +132,20 @@ func (p *Provider) Reset() {
 	p.mu.Unlock()
 }
 
+// attemptTimeout is the budget for one whole collection attempt: the credential
+// read plus the Ollama HTTP request.
+//
+// SPEC 4.4's 20 seconds is the budget for 采集, which starts when the attempt
+// starts — at the credential — not when the first byte of HTTP goes out. A host
+// that blocks either half therefore cannot hold the collector (or quiesce) past
+// this.
+func (p *Provider) attemptTimeout() time.Duration {
+	if p.timeout <= 0 {
+		return ollama.DefaultTimeout
+	}
+	return p.timeout
+}
+
 // bridge returns the host callback bridge of the generation currently serving.
 func (p *Provider) bridge() *hostBridge {
 	p.mu.Lock()
@@ -151,9 +165,26 @@ func (p *Provider) setHostBridge(call HostCall) {
 // startCollector starts this provider's background collector and returns the
 // function that stops it.
 //
-// The stop function cancels the goroutine's context and waits for it to exit, so
-// by the time quiesce returns no collection is still running and the library can
-// be unloaded. It must be called outside the state lock.
+// The stop function does two things, and both are needed:
+//
+//  1. it cancels the collector's context and waits for the collector goroutine
+//     to exit, so no sweep keeps running after quiesce;
+//  2. it then waits on the bridge's in-flight set, which is what closes the P1-b
+//     gap: a context.AfterFunc cancel callback runs on a runtime goroutine that
+//     the collector goroutine does not wait for, and it can still be inside
+//     host.http.cancel when the collector returns. Waiting on the in-flight set
+//     drains every such call, so by the time stop returns no host call this
+//     plugin started is still running and the library can be unloaded.
+//
+// BOTH waits are bounded, and for the same reason (P2-1): a synchronous C
+// callback cannot be abandoned by this plugin. If the collector goroutine is
+// parked inside host.auth.list, it will not notice the cancel until that call
+// returns, and waiting for it unbounded would make quiesce hang on exactly the
+// broken host this is meant to survive. So the collector wait is bounded by the
+// attempt budget plus a small margin, and when it expires the collector is left
+// to unwind on its own; the in-flight bound still applies underneath it.
+//
+// It must be called outside the state lock.
 func (p *Provider) startCollector(cfg Config) context.CancelFunc {
 	interval := time.Duration(cfg.IntervalSeconds) * time.Second
 	if interval <= 0 {
@@ -171,8 +202,43 @@ func (p *Provider) startCollector(cfg Config) context.CancelFunc {
 		worker.run(ctx)
 	}()
 
+	// The bridge is read once here rather than inside stop: a register that
+	// replaced it would otherwise leave the old generation's calls unbarriered.
+	bridge := p.bridge()
+
+	// One dead-man timer for the whole stop, so the two waits share a single
+	// budget rather than each getting its own.
 	return func() {
 		cancel()
-		<-done
+
+		waitBudget := p.attemptTimeout() + collectorBarrierGrace
+		stopped := make(chan struct{})
+		go func() {
+			<-done
+			if bridge != nil {
+				barrier, cancelBarrier := context.WithTimeout(context.Background(), waitBudget)
+				bridge.waitInflight(barrier)
+				cancelBarrier()
+			}
+			close(stopped)
+		}()
+
+		select {
+		case <-stopped:
+		case <-time.After(waitBudget):
+			// The collector (or a host call it made) did not return in time. The
+			// goroutine above is left waiting so it can finish the drain if the
+			// host ever answers; it is not detached work, it is the same drain
+			// that would have run a moment later.
+		}
 	}
 }
+
+// collectorBarrierGrace is added to the attempt budget when waiting for
+// in-flight host calls to drain.
+//
+// A callback that is genuinely progressing can take a little longer than the
+// budget that bounded the work it is cleaning up — opening or closing an
+// operation is a separate round trip — so the barrier allows that. It stays
+// finite so a wedged host cannot make quiesce wait forever.
+const collectorBarrierGrace = 2 * time.Second

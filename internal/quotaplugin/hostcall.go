@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -30,15 +31,99 @@ type HostCall func(ctx context.Context, method string, request []byte) ([]byte, 
 // only happen in tests or in a host that never called cliproxy_plugin_init.
 var ErrHostUnavailable = errors.New("the host callback bridge is not available")
 
+// errHostCallbackPanicked is the fixed, safe message a host callback panic is
+// reduced to.
+//
+// The recovered value is never formatted into it: a panicking host callback can
+// carry anything at all, including the request body it was handed, and the
+// request body of an Ollama collection carries the credential. A constant keeps
+// the panic from becoming a way out for the secret (SPEC 4.2).
+var errHostCallbackPanicked = fmt.Errorf("%w: the host callback panicked", ErrHostUnavailable)
+
 // hostBridge adapts the host callbacks this plugin uses onto plain Go types.
 // It also implements ollama.Transport (see Do) so the #2 collector can issue
 // its requests through the host's transport policy.
 type hostBridge struct {
+	// call is the raw host callback.
 	call HostCall
+	// inflight tracks host calls this plugin has started and not yet seen
+	// return. Quiesce waits on it (see waitInflight): a host call is the only
+	// thing this plugin does that outlives the goroutine that started it, so it
+	// is the only thing that has to be drained before the library is unloaded.
+	inflight inflightSet
+}
+
+// inflightSet counts outstanding host calls and offers a channel that is closed
+// while none are outstanding.
+//
+// It exists instead of a sync.WaitGroup because the wait has to be selectable
+// against a deadline, and a WaitGroup's Wait is not. The alternative — waiting
+// on the WaitGroup from a goroutine and selecting on that goroutine — would add
+// a goroutine per quiesce, which is exactly what this plugin is required not to
+// do (the collector's goroutine count must stay flat, SPEC 4.4).
+type inflightSet struct {
+	mu sync.Mutex
+	// count is the number of outstanding calls.
+	count int
+	// open reports whether idle is currently an unfolded channel that end() must
+	// close. It is separate from count == 0 because a set that was frozen while
+	// idle keeps a closed channel that must never be closed again.
+	open bool
+	// frozen stops new calls from reopening the channel once quiesce has taken
+	// the barrier: a call that starts after that point will be cancelled by the
+	// host anyway and must not extend the wait indefinitely.
+	frozen bool
+	// idle is closed while count == 0.
+	idle chan struct{}
+}
+
+func newInflightSet() inflightSet {
+	idle := make(chan struct{})
+	close(idle)
+	return inflightSet{idle: idle}
+}
+
+// begin registers one outstanding call. A call begun after the set is frozen is
+// not counted: quiesce has already passed the barrier and the host will refuse
+// or cancel it.
+func (s *inflightSet) begin() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.frozen {
+		return
+	}
+	if !s.open {
+		s.idle = make(chan struct{})
+		s.open = true
+	}
+	s.count++
+}
+
+// end retires one outstanding call.
+func (s *inflightSet) end() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.count <= 0 {
+		return
+	}
+	s.count--
+	if s.count == 0 && s.open {
+		close(s.idle)
+		s.open = false
+	}
+}
+
+// freeze stops counting new calls and returns the channel that is closed once
+// every call already registered has returned.
+func (s *inflightSet) freeze() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.frozen = true
+	return s.idle
 }
 
 func newHostBridge(call HostCall) *hostBridge {
-	return &hostBridge{call: call}
+	return &hostBridge{call: call, inflight: newInflightSet()}
 }
 
 // hostEnvelope mirrors pluginabi.Envelope. A callback that fails returns an
@@ -54,10 +139,19 @@ type hostEnvelope struct {
 
 // invoke calls one host method and unwraps the envelope.
 //
-// The error it returns is deliberately built from the envelope's own message
-// and never from the request or the credential: a host bridge failure must not
-// become a way for the API key to reach a log line (SPEC 4.2).
-func (b *hostBridge) invoke(ctx context.Context, method string, payload any, out any) error {
+// It is the one place a raw host callback is made, so it is where three
+// properties are established for every caller:
+//
+//  1. a panic raised anywhere in the callback becomes errHostCallbackPanicked
+//     rather than propagating. That covers a callback reached through
+//     context.AfterFunc on its own goroutine, where no caller's recover can
+//     help (the P1-a finding: a panicking cancel callback took the process
+//     down with exit 1);
+//  2. the call is registered as in-flight for its whole duration, including
+//     the panic path, so waitInflight cannot return while it is running;
+//  3. the returned error is built from the envelope's own message and never
+//     from the request or the credential (SPEC 4.2).
+func (b *hostBridge) invoke(ctx context.Context, method string, payload any, out any) (err error) {
 	if b == nil || b.call == nil {
 		return ErrHostUnavailable
 	}
@@ -65,6 +159,19 @@ func (b *hostBridge) invoke(ctx context.Context, method string, payload any, out
 	if errMarshal != nil {
 		return fmt.Errorf("encode %s request: %w", method, errMarshal)
 	}
+
+	// begin must run before the call, not as a defer: it is what marks this
+	// call as in flight for the whole duration. Deferring it would register the
+	// call only when it was already over, and the quiesce barrier would see an
+	// always-empty set.
+	b.inflight.begin()
+	defer b.inflight.end()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = errHostCallbackPanicked
+		}
+	}()
+
 	response, errCall := b.call(ctx, method, raw)
 	if errCall != nil {
 		// The host's own callback error may quote the request it rejected, and
@@ -93,7 +200,102 @@ func (b *hostBridge) invoke(ctx context.Context, method string, payload any, out
 	return nil
 }
 
-// hostHTTPRequest is the wire shape of pluginabi.HTTPRequest plus the callback
+// waitInflight blocks until every host call this bridge has started has
+// returned, or until ctx expires. It reports whether the bridge drained.
+//
+// This is the barrier the P1-b finding asks for. The collector's stop function
+// waits for the collector goroutine, but a context.AfterFunc cancel callback
+// runs on a runtime goroutine of its own and can still be inside
+// host.http.cancel after the collector has exited. Because every such call is
+// registered by invoke, waiting on this set drains exactly those calls.
+//
+// It adds no goroutine of its own: the wait is a plain select on a channel that
+// the last caller closes, so the collector's goroutine count stays flat
+// (SPEC 4.4).
+//
+// ctx bounds the wait. A host call that never returns cannot be abandoned by
+// this plugin — the callback is a synchronous C function — so an unbounded wait
+// would make quiesce hang forever on a broken host; the timeout reports that
+// instead, which is the same trade the collection budget makes.
+//
+// Once the barrier has been taken the set is frozen, so a call that starts
+// afterwards is not counted and cannot keep quiesce open indefinitely.
+func (b *hostBridge) waitInflight(ctx context.Context) bool {
+	if b == nil {
+		return true
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	idle := b.inflight.freeze()
+	select {
+	case <-idle:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// callBounded performs one host callback under a deadline the plugin enforces
+// for itself (P2-1).
+//
+// The problem it solves: a deadline set by this package does not reach the work
+// behind a host callback. The native host entry point rebuilds its context from
+// context.Background() (internal/pluginhost/host_callbacks_unix.go:45), so a
+// single context.WithTimeout cannot interrupt a synchronous C call. The host's
+// HTTP operation bridge can interrupt host.http.do, but the credential reads
+// (host.auth.list / host.auth.get) have no operation at all — and those run
+// before any HTTP request, so an enumeration that never returns would hold the
+// collector, and therefore quiesce, forever.
+//
+// The budget is therefore enforced from this side: the callback runs on a
+// goroutine and the caller stops waiting when the deadline passes. Two things
+// keep that from becoming a leak:
+//
+//   - invoke registers the call as in-flight before it starts and unregisters
+//     it when it returns, so the quiesce barrier (waitInflight) still waits for
+//     an abandoned call rather than letting the library unload underneath it;
+//   - the goroutine is per call, and exits as soon as the host call returns, so
+//     it cannot accumulate across refreshes.
+//
+// A callback on a context with no deadline takes the synchronous path, so the
+// usual inbound quota fetch adds no goroutine.
+func (b *hostBridge) callBounded(ctx context.Context, method string, payload any, out any) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if b == nil || b.call == nil {
+		return b.invoke(ctx, method, payload, out)
+	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		return b.invoke(ctx, method, payload, out)
+	}
+	if ctx.Err() != nil {
+		return fmt.Errorf("%s was not attempted: %w", method, ctx.Err())
+	}
+
+	// Buffered so an abandoned result never strands the sender.
+	done := make(chan error, 1)
+	go func() {
+		// invoke already recovers a panicking host callback; this covers the
+		// bookkeeping around it so nothing can escape on this goroutine.
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				done <- errHostCallbackPanicked
+			}
+		}()
+		done <- b.invoke(ctx, method, payload, out)
+	}()
+
+	select {
+	case errCall := <-done:
+		return errCall
+	case <-ctx.Done():
+		return fmt.Errorf("%s did not finish before the deadline: %w", method, ctx.Err())
+	}
+}
+
+// hostHTTPRequest is the wire shape of pluginapi.HTTPRequest plus the callback
 // scope. pluginapi.HTTPRequest's fields have no json tags of their own, so the
 // host decodes them case-insensitively from these names. HostCallbackID and
 // OperationID are the two scopes the host uses to cancel an in-flight call
@@ -162,19 +364,23 @@ func (b *hostBridge) do(ctx context.Context, request pluginapi.HTTPRequest, call
 }
 
 // listAuths enumerates the credentials the host currently holds.
+//
+// It goes through callBounded so a host that never answers this callback cannot
+// hold a sweep — and therefore quiesce — forever (P2-1).
 func (b *hostBridge) listAuths(ctx context.Context) ([]pluginapi.HostAuthFileEntry, error) {
 	var response hostAuthListResponse
-	if errInvoke := b.invoke(ctx, pluginabi.MethodHostAuthList, map[string]any{}, &response); errInvoke != nil {
+	if errInvoke := b.callBounded(ctx, pluginabi.MethodHostAuthList, map[string]any{}, &response); errInvoke != nil {
 		return nil, errInvoke
 	}
 	return response.Files, nil
 }
 
-// getAuth reads one credential's raw stored JSON.
+// getAuth reads one credential's raw stored JSON, under the caller's budget
+// (P2-1).
 func (b *hostBridge) getAuth(ctx context.Context, authIndex string) (hostAuthGetResponse, error) {
 	var response hostAuthGetResponse
 	payload := map[string]string{"auth_index": authIndex}
-	if errInvoke := b.invoke(ctx, pluginabi.MethodHostAuthGet, payload, &response); errInvoke != nil {
+	if errInvoke := b.callBounded(ctx, pluginabi.MethodHostAuthGet, payload, &response); errInvoke != nil {
 		return hostAuthGetResponse{}, errInvoke
 	}
 	return response, nil

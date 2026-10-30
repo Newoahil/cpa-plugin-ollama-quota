@@ -106,13 +106,21 @@ func (s *store) forget(key string) {
 // failure after an earlier success returns those earlier figures marked stale;
 // a failure with nothing behind it returns an error and no numbers at all
 // (SPEC 4.3).
+//
+// The attempt as a whole — credential read included, not just the Ollama HTTP
+// request — is bounded by one deadline (P2-1). Both host calls it makes
+// (host.auth.get and host.http.do) enforce it themselves, because a deadline set
+// here cannot reach a synchronous C callback (see hostBridge.callBounded).
 func (p *Provider) fetchQuota(ctx context.Context, request pluginapi.QuotaFetchRequest, callbackID string) (pluginapi.QuotaFetchResponse, error) {
 	providerKey := ProviderKey(request.Provider)
 	if providerKey != "" && providerKey != QuotaIdentifier {
 		return pluginapi.QuotaFetchResponse{}, UnsupportedProviderError{Provider: providerKey}
 	}
 
-	credential, errCredential := p.resolveCredential(ctx, request)
+	budget, cancelBudget := context.WithTimeout(ctx, p.attemptTimeout())
+	defer cancelBudget()
+
+	credential, errCredential := p.resolveCredential(budget, request)
 	if errCredential != nil {
 		return pluginapi.QuotaFetchResponse{}, errCredential
 	}
@@ -131,7 +139,7 @@ func (p *Provider) fetchQuota(ctx context.Context, request pluginapi.QuotaFetchR
 		return pluginapi.QuotaFetchResponse{}, &backoffError{until: until, now: now}
 	}
 
-	snapshot, errFetch := p.collect(ctx, credential, callbackID, now)
+	snapshot, errFetch := p.collect(budget, credential, callbackID, now)
 	if errFetch == nil {
 		p.store.succeeded(key, snapshot)
 		entry, _ := p.store.load(key)
