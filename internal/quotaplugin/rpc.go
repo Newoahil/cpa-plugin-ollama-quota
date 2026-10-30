@@ -64,6 +64,18 @@ func NewHandler(state *State) *Handler {
 	return &Handler{state: state, ctx: context.Background()}
 }
 
+// Shutdown retires the instance behind this handler. Later calls that reach
+// this same handler are refused, which is what stops a call still in flight
+// during an unload from resurrecting a retired generation.
+func (h *Handler) Shutdown() {
+	h.state.Shutdown()
+}
+
+// State exposes the instance this handler drives, for diagnostics and tests.
+func (h *Handler) State() *State {
+	return h.state
+}
+
 // Handle dispatches one RPC call. It never returns a Go error: a failure of
 // the plugin itself belongs in the envelope so the host can classify it (and
 // treat unknown_method as "not supported").

@@ -37,8 +37,9 @@ func (p Phase) String() string {
 }
 
 // ErrStopped is returned by Register on an instance that has been shut down.
-// Shutdown is terminal by contract, so a re-register cannot resurrect the
-// instance and start serving quota from a library the host already retired.
+// Stopped is terminal for one State: a late register arriving after shutdown
+// cannot resurrect it. A genuinely new load gets a new State from Runtime.Init,
+// not a second chance on this one.
 var ErrStopped = errors.New("plugin instance is stopped")
 
 // State tracks one loaded plugin instance across the register / quiesce /
@@ -49,9 +50,16 @@ var ErrStopped = errors.New("plugin instance is stopped")
 //	new       --register--> active
 //	active    --register--> active      (reconfigure on hot reload)
 //	quiescing --register--> active      (hot-reload retry / rollback)
-//	active    --quiesce-->  quiescing   (idempotent: quiescing -> quiescing)
-//	quiescing --quiesce-->  quiescing
-//	*         --shutdown--> stopped     (terminal; quiesce runs first)
+//	new       --quiesce-->  quiescing   (quiesced before ever registering)
+//	active    --quiesce-->  quiescing
+//	quiescing --quiesce-->  quiescing   (idempotent)
+//	stopped   --quiesce-->  stopped     (idempotent: shutdown already cancelled)
+//	new       --shutdown--> stopped
+//	active    --shutdown--> stopped     (cancels directly; no quiescing stop)
+//	quiescing --shutdown--> stopped
+//
+// PhaseStopped admits no register. A reinstall is a new ABI generation and goes
+// through Runtime.Init, which builds a fresh State rather than reviving this one.
 //
 // The phase and the quota provider are one protected pair: every transition
 // changes both under the same lock, so a concurrent Register can never observe

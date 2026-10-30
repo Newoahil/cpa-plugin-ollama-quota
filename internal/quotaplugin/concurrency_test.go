@@ -8,11 +8,16 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 )
 
-// The review reproduced this with a blocking collector hook: Quiesce set the
-// phase to quiescing, then blocked in stop(), Register won the race and moved
-// the state back to active, and only then did Quiesce continue and cancel the
-// provider. The result was Phase()==active with Track()==false, so every
-// fetch was refused while the state claimed to be serving.
+// The review reproduced this with a blocking collector hook: Quiesce moved the
+// phase to quiescing and then parked in its stop hook, Register ran to
+// completion in the meantime and moved the phase back to active, and when
+// Quiesce resumed it cancelled the provider anyway. The result was
+// Phase()==active with Track()==false, so every fetch was refused while the
+// state claimed to be serving.
+//
+// The fix keeps the phase change and the provider cancellation in one critical
+// section, so the stop hook now runs after both are committed: Register either
+// waits for the whole transition or happens entirely after it.
 //
 // This test forces that interleaving with channels instead of sleeps. It must
 // stay deterministic: the hook signals that Quiesce has entered, and Register
@@ -35,8 +40,8 @@ func TestQuiesceAndRegisterCannotInterleave(t *testing.T) {
 		quiesceDone <- state.Quiesce()
 	}()
 
-	// Wait until Quiesce is provably inside its stop hook — the phase has been
-	// committed but the provider has not been cancelled yet.
+	// Wait until Quiesce is provably inside its stop hook. By then the phase is
+	// quiescing and the provider has already been cancelled.
 	<-enteredStop
 
 	registerDone := make(chan struct{})
@@ -47,11 +52,11 @@ func TestQuiesceAndRegisterCannotInterleave(t *testing.T) {
 		}
 	}()
 
-	// Give Register every chance to race ahead of Quiesce. With the state and
-	// the provider reset under one lock, it must block until Quiesce is done;
-	// before the fix this returned in microseconds and the invariant below
-	// failed. The wait only has to cover "did it sneak through", not a real
-	// deadline, so it stays short.
+	// Give Register every chance to race ahead. It does not need to wait for the
+	// stop hook — that is now outside the lock — but it does have to wait for
+	// Quiesce to commit its phase change and cancellation. Before the fix this
+	// returned before Quiesce had cancelled, leaving phase=active with a dead
+	// provider, and the invariant below failed.
 	select {
 	case <-registerDone:
 	case <-time.After(250 * time.Millisecond):

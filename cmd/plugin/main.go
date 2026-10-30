@@ -53,16 +53,23 @@ import (
 
 func main() {}
 
-// The host serializes lifecycle calls for one library instance, but quota
-// fetches run on other goroutines while quiesce is in progress, so the state
-// guards itself.
-var handler = quotaplugin.NewHandler(quotaplugin.NewState())
+// runtime owns the handler for the current ABI generation.
+//
+// Go package state survives dlclose, so a second load of the same file finds
+// whatever the first load left behind. cliproxy_plugin_init therefore has to
+// build a fresh instance rather than reuse the one the host already shut down —
+// otherwise reinstalling after DELETE hands the host a stopped State and the
+// plugin registers with no capabilities. See internal/quotaplugin/runtime.go.
+var runtime = quotaplugin.NewRuntime()
 
 //export cliproxy_plugin_init
 func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
 	if plugin == nil {
 		return 1
 	}
+	// Every init is a new generation: unload then reinstall must work even for
+	// the same file, and the previous generation's late calls stay refused.
+	runtime.Init()
 	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
@@ -78,6 +85,13 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	}
 	if method == nil {
 		writeResponse(response, quotaplugin.ErrorEnvelope("invalid_method", "method is required"))
+		return 1
+	}
+	handler := runtime.Current()
+	if handler == nil {
+		// Calls can only arrive after init populated the function table, but a
+		// nil guard here beats a nil dereference inside the host process.
+		writeResponse(response, quotaplugin.ErrorEnvelope("plugin_not_initialized", "cliproxy_plugin_init has not run"))
 		return 1
 	}
 	var requestBytes []byte
@@ -102,7 +116,7 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
-	handler.Handle(pluginabi.MethodPluginShutdown, nil)
+	runtime.Shutdown()
 }
 
 func writeResponse(response *C.cliproxy_buffer, raw []byte) {
