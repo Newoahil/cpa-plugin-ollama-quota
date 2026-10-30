@@ -94,7 +94,7 @@ omc 现在能显示 Ollama Cloud 的额度和余额，但那套东西在 omc 自
 
 | # | 标准 | 怎么验 |
 |---|---|---|
-| AC-1 | 装进 CPA 后，额度页出现 Ollama 行，显示余额和套餐 | 装插件，打开 `/v0/management/credentials/quota/fetch` 看返回里有 ollama |
+| AC-1 | 装进 CPA 后，额度页出现 Ollama 行，显示余额和套餐 | 装插件，用 `POST /v0/management/quota/fetch`（JSON body 带 `auth_index`）看返回里有 ollama |
 | AC-2 | 用 API Key 能取到余额 | 配一条真凭证，看余额数字与 ollama.com 网站一致 |
 | AC-3 | 没有 API Key 时回退到 cookie 解析 | 只配 cookie，看能取到额度窗口 |
 | AC-4 | 上游返回改版 HTML 时不返回错数 | 单测：喂改版 HTML，断言 status=error |

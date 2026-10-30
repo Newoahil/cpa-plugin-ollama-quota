@@ -5,14 +5,16 @@ CLIProxyAPI 插件：把 Ollama Cloud 的额度与余额接进 CPA 原生的凭�
 ## 这个插件做什么
 
 CPA 有一个 `QuotaProvider` 接口，插件实现它就能把某个供应商的额度喂给 CPA 自己的额度页
-（`/v0/management/credentials/quota/*`），和 Codex、Claude、Antigravity 的额度并排展示。
+（`GET /v0/management/quota/providers`、`POST /v0/management/quota/fetch`），
+和 Codex、Claude、Antigravity 的额度并排展示。
 
 本插件只做一件事：读 Ollama Cloud 账号的余额和额度窗口，按 CPA 的额度模型返回。
 
 ## 硬约束
 
-**安装和升级都不重启 CPA 进程。** CPA 的插件热加载靠换版本文件名触发；插件必须能在换版本时
-安全卸载（`plugin.quiesce` → 卸载 → 加载新版本 → `plugin.register`），在途的推理请求不受影响。
+**装上之后，升级不重启 CPA 进程。** 首次启用插件子系统要重启一次（见下面的安装步骤）；
+之后换版本靠 CPA 的插件热加载，按文件名里的版本号识别；插件必须能在换版本时安全卸载
+（`plugin.quiesce` → 卸载 → 加载新版本 → `plugin.register`），在途的推理请求不受影响。
 
 **凭据不外泄。** Ollama 的 session cookie 和 API Key 是高价值凭证，不能出现在日志、错误字符串、
 返回值和任何持久化快照里。
@@ -42,6 +44,99 @@ omc 里已有这两条路的实现（`internal/ollama/`，`LambdaTheory/oh-my-cp
 - Ollama 的 OAuth 登录（走 CPA 已有的凭证体系）
 - 用量历史、图表、计费预估
 - 除了 ollama 之外的任何供应商
+
+## 构建
+
+本插件编译成 CPA 的动态库插件（`-buildmode=c-shared`）。本机没有 Go，用 Docker 编译 Linux 产物：
+
+```sh
+scripts/build.sh                    # linux/amd64 -> dist/ollama-quota-v0.1.2.so
+scripts/build.sh -o dist/foo.so     # 指定输出路径
+scripts/build.sh --go               # 用本机的 Go 和 C 工具链编译当前平台
+```
+
+`-buildmode=c-shared` 需要**目标平台的 C 编译器**。`golang:1.26-bookworm` 镜像里只有 Linux 的，
+所以默认只出 Linux `.so`。**macOS `.dylib` 和 Windows `.dll` 这个脚本不提供**——
+要在对应平台上装好 Go 和 Xcode CLT / MinGW 后用 `--go` 本机编（`--go` 跟着主机 GOOS 走，
+不交叉编译；跨平台 C 工具链本仓库没有配置，也不在 #1 范围内）。
+
+产物名里的 `-v<版本>` 不是装饰：CPA 靠文件名里的版本号判断"这是新版本"，
+没有版本后缀的库会被当成同一个文件，不会触发热替换。
+
+## 怎么装进 CPA 测试
+
+下面这份配置在 `CLIProxyAPI v8.0.47` 上验过：插件加载、注册、额度接口都通。
+
+> **先备份 `config.yaml`。** CPA 会改写这个文件：启动时把 `management.secret-key` 换成哈希，
+> `DELETE /v0/management/plugins/<id>` 会把 `plugins.configs.<id>` 整段删掉（并重新排版整个文件）。
+> 本插件不需要你手动改这份配置之外的任何东西。
+
+1. 把 `dist/` 里的库放进 CPA 的插件目录（路径相对于 CPA 的工作目录）：
+
+   ```sh
+   cp dist/ollama-quota-v0.1.2.so /path/to/cpa/plugins/
+   ```
+
+2. 在 CPA 的 `config.yaml` 里打开插件并允许本插件。一份完整的例子：
+
+   ```yaml
+   config-version: 8
+
+   server:
+     host: "0.0.0.0"
+     port: 8317
+
+   management:
+     allow-remote: true
+     secret-key: "换成你自己的"
+
+   plugins:
+     enabled: true            # 插件总开关，不开就一个都不加载
+     dir: "plugins"           # 相对 CPA 工作目录，也可以写绝对路径
+     configs:
+       ollama-quota:
+         enabled: true        # 单个插件的开关
+         priority: 1
+         interval_seconds: 900
+
+   oauth:
+     auth-dir: "~/.cli-proxy-api"
+   ```
+
+   `config-version: 8` 只是标明文件已经是 v8 布局，**不是插件的开关**。
+   实测（v8.0.47）：带不带这一行、旧版平铺写法（`port` / `remote-management`）还是 v8 嵌套写法，
+   启动后 `plugins.configs` 都保留、插件都正常注册。缺它不会导致插件被卸载。
+
+3. **首次启用插件子系统要重启一次 CPA**；之后换版本不用重启。启动日志里应该出现：
+
+   ```
+   pluginhost: plugin loaded plugin_id=ollama-quota version=0.1.2
+   pluginhost: plugin registered plugin_id=ollama-quota ...
+   ```
+
+4. 打开管理界面的凭证额度页，或者直接问接口（`<mgmt-key>` 是 `management.secret-key`）：
+
+   ```sh
+   curl -H "Authorization: Bearer <mgmt-key>" http://127.0.0.1:8317/v0/management/plugins
+   curl -H "Authorization: Bearer <mgmt-key>" http://127.0.0.1:8317/v0/management/quota/providers
+   curl -H "Authorization: Bearer <mgmt-key>" -H 'Content-Type: application/json' \
+        -X POST http://127.0.0.1:8317/v0/management/quota/fetch \
+        -d '{"auth_index":"<凭证的 auth_index>"}'
+   ```
+
+   第一条里应看到 `"id": "ollama-quota"`、`"registered": true`、`"quota_provider": "ollama"`；
+   第二条的 `providers` 里应有 `ollama`。
+
+   额度接口是 `GET /v0/management/quota/providers` 和 `POST /v0/management/quota/fetch`
+   （fetch 要 POST + JSON body）。`/v0/management/credentials/quota/providers` 在 v8.0.47 上
+   是 404，别用那条。
+
+5. 卸载：`DELETE /v0/management/plugins/ollama-quota`。CPA 会先 `plugin.quiesce` 再卸库，
+   进程不重启；之后的额度页里不再有 Ollama 行。**注意这条命令会把 `plugins.configs.ollama-quota`
+   从 `config.yaml` 里删掉**，想重新装回来要再把上面那段加回去。
+
+> 当前版本 0.1.2 是骨架：额度数字是固定样例（一个 5 小时窗口、已用 50%、余额 $10.00），
+> 真实采集在 #2 补。`POST /v0/management/quota/fetch` 返回样例数据，`reset` 一律返回"不支持"。
 
 ## 文档
 
