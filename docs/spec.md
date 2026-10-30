@@ -37,7 +37,8 @@ omc 现在能显示 Ollama Cloud 的额度和余额，但那套东西在 omc 自
 
 按顺序试：
 
-1. `POST https://ollama.com/api/balance`，带 `Authorization: Bearer <API Key>`
+1. `GET https://ollama.com/api/balance`，带 `Authorization: Bearer <API Key>`
+   （2026-10-30 核实：官方 OpenAPI 定义在 `get:` 下，不是 POST）
 2. 失败或没有 API Key 时，`GET https://ollama.com/settings`，带 session cookie，解析 HTML
 
 两条都失败就上报失败状态，保留上一次成功读到的值并标成「已过期」，不假装是新数据。
