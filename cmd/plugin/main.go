@@ -53,13 +53,23 @@ import (
 
 func main() {}
 
-// runtime owns the handler for the current ABI generation.
+// runtime tracks every ABI generation the host has initialised and routes each
+// call to the right one.
 //
 // Go package state survives dlclose, so a second load of the same file finds
 // whatever the first load left behind. cliproxy_plugin_init therefore has to
 // build a fresh instance rather than reuse the one the host already shut down —
 // otherwise reinstalling after DELETE hands the host a stopped State and the
-// plugin registers with no capabilities. See internal/quotaplugin/runtime.go.
+// plugin registers with no capabilities.
+//
+// The three entry points below are the same global symbols for every init, and
+// the ABI gives call and shutdown no way to say which init they belong to (no
+// host pointer, no epoch, and a C function pointer cannot close over per-init
+// state). So generation identity comes from the host's call order instead: one
+// init per loaded client, one shutdown per client, matched oldest first. See
+// internal/quotaplugin/runtime.go for the ordering evidence and why retiring
+// the oldest generation is what keeps a replaced client's late shutdown from
+// stopping the one that replaced it.
 var runtime = quotaplugin.NewRuntime()
 
 //export cliproxy_plugin_init
@@ -68,7 +78,8 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 		return 1
 	}
 	// Every init is a new generation: unload then reinstall must work even for
-	// the same file, and the previous generation's late calls stay refused.
+	// the same file. The function table is filled with the same symbols every
+	// time; which generation they act on is decided at call time by Runtime.
 	runtime.Init()
 	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
@@ -77,6 +88,15 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	return 0
 }
 
+// cliproxyPluginCall serves a call with the newest generation.
+//
+// The call carries no indication of which init's function table issued it, so a
+// call made through a retired table is served by the newest generation instead
+// of being refused. That is the best the ABI allows, and it is harmless: the
+// host quiesces a client before replacing it and never calls it again after the
+// replacement succeeds, so a call only reaches the newest generation while that
+// generation is the live one.
+//
 //export cliproxyPluginCall
 func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
 	if response != nil {
@@ -114,6 +134,14 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 	}
 }
 
+// cliproxyPluginShutdown retires the oldest generation that is still live.
+//
+// The host calls shutdown once per init, and issues it for a replaced client
+// only after the replacement is serving, so the generation this call belongs to
+// is always the oldest one still waiting. Retiring that one — never the newest —
+// is what keeps a replaced client's late shutdown from stopping the instance
+// that replaced it.
+//
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
 	runtime.Shutdown()

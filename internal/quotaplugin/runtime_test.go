@@ -134,3 +134,110 @@ func TestRuntimeBeforeInit(t *testing.T) {
 	// Shutdown before Init must not panic.
 	runtime.Shutdown()
 }
+
+// Shutdown is idempotent: the host must be able to call it more than once
+// without the second call touching a generation that is already stopped.
+func TestRuntimeShutdownIsIdempotent(t *testing.T) {
+	runtime := NewRuntime()
+
+	handler := runtime.Init()
+	if _, err := handler.Handle(pluginabi.MethodPluginRegister, registerPayload(t, enabledConfig)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	runtime.Shutdown()
+	if phase := runtime.State().Phase(); phase != PhaseStopped {
+		t.Fatalf("phase after shutdown = %s, want stopped", phase)
+	}
+	for i := 0; i < 3; i++ {
+		runtime.Shutdown()
+		if phase := runtime.State().Phase(); phase != PhaseStopped {
+			t.Fatalf("phase after repeated shutdown #%d = %s, want stopped", i, phase)
+		}
+		if live := runtime.LiveGenerations(); live != 0 {
+			t.Fatalf("live generations after repeated shutdown = %d, want 0", live)
+		}
+	}
+	// Still refused after the extra calls: nothing revived the instance.
+	if raw, err := handler.Handle(pluginabi.MethodPluginRegister, registerPayload(t, enabledConfig)); err != nil {
+		t.Fatalf("late register: %v", err)
+	} else if decodeEnvelope(t, raw).OK {
+		t.Fatal("a stopped instance must not accept a register after repeated shutdown")
+	}
+}
+
+// The host issues one shutdown per init, and a replacement's retired client is
+// shut down after the replacement is live. Matching shutdowns to generations
+// oldest first is what makes that late call land on the retired generation
+// instead of the one now serving.
+func TestRuntimeShutdownRetiresOldestGeneration(t *testing.T) {
+	runtime := NewRuntime()
+
+	first := runtime.Init()
+	if _, err := first.Handle(pluginabi.MethodPluginRegister, registerPayload(t, enabledConfig)); err != nil {
+		t.Fatalf("first register: %v", err)
+	}
+	// Hot replacement: the host inits the new client while the old one is still
+	// held, and registers it before the old client is shut down.
+	second := runtime.Init()
+	if _, err := second.Handle(pluginabi.MethodPluginRegister, registerPayload(t, enabledConfig)); err != nil {
+		t.Fatalf("second register: %v", err)
+	}
+	if live := runtime.LiveGenerations(); live != 2 {
+		t.Fatalf("live generations = %d, want 2", live)
+	}
+
+	// The retired client's shutdown arrives late, after the new generation was
+	// registered. It must retire the first generation, not the live one.
+	runtime.Shutdown()
+	if phase := first.State().Phase(); phase != PhaseStopped {
+		t.Fatalf("retired generation phase = %s, want stopped", phase)
+	}
+	if phase := second.State().Phase(); phase != PhaseActive {
+		t.Fatalf("live generation phase after the retired client's shutdown = %s, want active", phase)
+	}
+	if _, ok := second.State().Provider(); !ok {
+		t.Fatal("the live generation must keep serving after the retired client shuts down")
+	}
+	raw, err := second.Handle(pluginabi.MethodQuotaFetch, []byte(`{"provider":"ollama"}`))
+	if err != nil {
+		t.Fatalf("live fetch: %v", err)
+	}
+	if envelope := decodeEnvelope(t, raw); !envelope.OK {
+		t.Fatalf("the live generation must still fetch after the retired client shuts down: %+v", envelope.Error)
+	}
+
+	// The live client's own shutdown then retires it.
+	runtime.Shutdown()
+	if phase := second.State().Phase(); phase != PhaseStopped {
+		t.Fatalf("live generation phase after its own shutdown = %s, want stopped", phase)
+	}
+	if live := runtime.LiveGenerations(); live != 0 {
+		t.Fatalf("live generations = %d, want 0", live)
+	}
+}
+
+// The reinstall sequence the host actually uses is shut down, then initialised
+// again; each generation is retired by its own shutdown and the new one serves.
+func TestRuntimeReinstallCycleKeepsServing(t *testing.T) {
+	runtime := NewRuntime()
+	for cycle := 1; cycle <= 3; cycle++ {
+		handler := runtime.Init()
+		raw, err := handler.Handle(pluginabi.MethodPluginRegister, registerPayload(t, enabledConfig))
+		if err != nil {
+			t.Fatalf("cycle %d register: %v", cycle, err)
+		}
+		if envelope := decodeEnvelope(t, raw); !envelope.OK {
+			t.Fatalf("cycle %d register failed: %+v", cycle, envelope.Error)
+		}
+		if _, ok := runtime.State().Provider(); !ok {
+			t.Fatalf("cycle %d must serve quota", cycle)
+		}
+		runtime.Shutdown()
+		if phase := handler.State().Phase(); phase != PhaseStopped {
+			t.Fatalf("cycle %d phase after shutdown = %s, want stopped", cycle, phase)
+		}
+		if live := runtime.LiveGenerations(); live != 0 {
+			t.Fatalf("cycle %d live generations = %d, want 0", cycle, live)
+		}
+	}
+}
