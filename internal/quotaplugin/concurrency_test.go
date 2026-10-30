@@ -186,6 +186,34 @@ func TestRPCSurfaceRefusesWorkWhenNotActive(t *testing.T) {
 	}
 }
 
+// The collector stop function is code the plugin does not own, so it must run
+// outside the state lock. A stop that reads back the plugin's own state is the
+// obvious thing #2 will write, and running it under the lock deadlocks. This
+// test would hang (rather than fail) if that regressed, so it relies on the
+// package test timeout.
+func TestCollectorStopCanReenterState(t *testing.T) {
+	state := NewState()
+	if _, err := state.Register([]byte("enabled: true\n")); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	observed := make(chan Phase, 1)
+	state.SetCollector(func() {
+		// A real collector would check whether it is being shut down here.
+		observed <- state.Phase()
+	})
+
+	state.Quiesce()
+
+	select {
+	case phase := <-observed:
+		if phase == PhaseActive {
+			t.Errorf("stop saw phase %s; the phase should already be quiescing", phase)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("collector stop never ran")
+	}
+}
+
 // concurrentQuiesceAndRegister hammers the two entry points from several
 // goroutines; with the phases and the provider under one lock there must be no
 // interleaving that leaves them disagreeing.

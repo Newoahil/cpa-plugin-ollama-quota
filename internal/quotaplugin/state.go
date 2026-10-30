@@ -53,17 +53,13 @@ var ErrStopped = errors.New("plugin instance is stopped")
 //	quiescing --quiesce-->  quiescing
 //	*         --shutdown--> stopped     (terminal; quiesce runs first)
 //
-// Every phase change and its side effects (re-arming or cancelling the quota
-// provider, stopping the collector) happen under the same lock. Splitting them
-// lets a concurrent Register observe the new phase while the provider is still
-// cancelled — active phase, provider refusing work — which is what the review
-// reproduced. Holding the lock across the side effects costs a short critical
-// section and buys a state that cannot lie about itself.
-//
-// Because the lock covers side effects, the collector stop function must not
-// call back into State: it would deadlock. A context.CancelFunc satisfies this;
-// a stop function that wants to inspect the plugin should signal its own
-// goroutine instead of calling in.
+// The phase and the quota provider are one protected pair: every transition
+// changes both under the same lock, so a concurrent Register can never observe
+// "active" while the provider is still cancelled. That is the invariant the
+// review broke. The collector stop function is the one exception — it is code
+// we did not write, and calling it under the lock means any call back into
+// State deadlocks. It is collected under the lock (so stop is invoked exactly
+// once) and called after the lock is released.
 type State struct {
 	mu          sync.Mutex
 	phase       Phase
@@ -103,40 +99,49 @@ func (s *State) Register(configYAML []byte) (Config, error) {
 // Quiesce refuses new work and stops in-flight work. It returns the phase it
 // was in before the call, which tests use to prove idempotence.
 //
-// The phase change, the collector stop and the provider cancellation all run
-// under one lock, so a concurrent Register sees either the whole pre-quiesce
-// state or the whole post-quiesce state, never a mixture.
+// The phase change and the provider cancellation happen under one lock. The
+// collector stop is taken under the lock and invoked after it is released.
 func (s *State) Quiesce() Phase {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	previous := s.phase
 	if previous == PhaseStopped || previous == PhaseQuiescing {
+		s.mu.Unlock()
 		return previous
 	}
 	s.phase = PhaseQuiescing
-	if stop := s.collectStop; stop != nil {
-		s.collectStop = nil
+	stop := s.takeCollectorLocked()
+	s.provider.CancelAll()
+	s.mu.Unlock()
+
+	if stop != nil {
 		stop()
 	}
-	s.provider.CancelAll()
 	return previous
 }
 
 // Shutdown is quiesce plus the terminal phase transition.
 func (s *State) Shutdown() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.phase == PhaseStopped {
+		s.mu.Unlock()
 		return
 	}
 	s.phase = PhaseStopped
-	if stop := s.collectStop; stop != nil {
-		s.collectStop = nil
+	stop := s.takeCollectorLocked()
+	s.provider.CancelAll()
+	s.mu.Unlock()
+
+	if stop != nil {
 		stop()
 	}
-	s.provider.CancelAll()
+}
+
+// takeCollectorLocked detaches the collector stop function so it is called
+// exactly once. The caller must invoke it after releasing the lock.
+func (s *State) takeCollectorLocked() context.CancelFunc {
+	stop := s.collectStop
+	s.collectStop = nil
+	return stop
 }
 
 // Provider returns the quota provider while the instance accepts new work.
@@ -174,18 +179,19 @@ func (s *State) Config() Config {
 // collector. #2 installs the real collector here; quiesce and shutdown call it
 // before the host unloads the library.
 //
-// A collector installed on an already-quiesced instance is stopped
-// immediately: the instance is not accepting work, so a collector must not
-// start collecting.
+// A collector installed on an instance that is not accepting work is stopped
+// immediately, outside the lock, so the caller cannot deadlock by inspecting
+// the plugin from inside stop.
 func (s *State) SetCollector(stop context.CancelFunc) {
 	if stop == nil {
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.phase == PhaseActive {
 		s.collectStop = stop
+		s.mu.Unlock()
 		return
 	}
+	s.mu.Unlock()
 	stop()
 }
