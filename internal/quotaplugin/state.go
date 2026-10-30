@@ -93,6 +93,12 @@ type State struct {
 	// drainAttempts counts bounded drain judgements, so a caller (and a test)
 	// can tell a real re-check apart from an early return.
 	drainAttempts uint64
+	// orphanDrains holds stops whose drain did not finish and which no longer
+	// own the live collector: a reconfigure replaced them, or they were
+	// installed after a quiesce had already begun. A callback they left
+	// running is still running, so every later drain re-judges them instead
+	// of reporting an empty in-flight set from the new collector alone.
+	orphanDrains []func() drainOutcome
 	// collectorStart starts the background collector and installs its stop
 	// function. Register calls it on every transition into active; a nil hook
 	// means this instance runs without a collector (tests that only exercise
@@ -177,8 +183,17 @@ func (s *State) Register(configYAML []byte) (Config, error) {
 	// The stop function is code this package owns only nominally: it cancels a
 	// context and waits for a goroutine that may be mid-request. It must run
 	// outside the lock, exactly like the one quiesce calls.
+	//
+	// If it could not finish, the callback it left behind is still running and
+	// the new collector knows nothing about it. Retaining the stop keeps that
+	// work visible to later drains instead of letting a fresh, empty in-flight
+	// set report success.
 	if stopPrevious != nil {
-		stopPrevious()
+		if outcome := stopPrevious(); !outcome.drained {
+			s.mu.Lock()
+			s.retainUndrainedLocked(stopPrevious, false)
+			s.mu.Unlock()
+		}
 	}
 	if start != nil {
 		// start installs its own stop function through SetCollector, which stops
@@ -219,21 +234,21 @@ func (s *State) Register(configYAML []byte) (Config, error) {
 func (s *State) Quiesce() (Phase, error) {
 	s.mu.Lock()
 	previous := s.phase
-	if previous == PhaseStopped {
-		s.mu.Unlock()
-		return previous, nil
+	if previous != PhaseStopped {
+		s.phase = PhaseQuiescing
 	}
-	s.phase = PhaseQuiescing
 	s.provider.CancelAll()
-	// The stop function is deliberately NOT taken here: it is retained so a retry can re-judge.
+	// The stop function is deliberately NOT taken here: it is retained so a
+	// retry can re-judge.
 	stop := s.collectStop
 	s.mu.Unlock()
 
-	// A repeated quiesce re-judges the drain instead of trusting the phase.
-	// PhaseQuiescing only says a quiesce has started; an earlier one may have
-	// given up with a host call still running, and answering nil here is
-	// exactly the false success the review found (a callback that never
-	// exited was reported as safe to unload).
+	// Phase is NEVER the answer: neither PhaseQuiescing nor PhaseStopped says
+	// anything about whether a host call is still running. A failed Shutdown
+	// leaves the phase Stopped with work still in flight, so short-circuiting
+	// on it here would report a library that is safe to unload while a callback
+	// is still inside the host -- the cross-entry version of the false success
+	// the reviews kept finding. Every call runs the bounded drain judgement.
 	return previous, s.drain(stop)
 }
 
@@ -247,19 +262,19 @@ func (s *State) Quiesce() (Phase, error) {
 // it unloads.
 func (s *State) Shutdown() error {
 	s.mu.Lock()
-	previous := s.phase
 	s.phase = PhaseStopped
 	s.provider.CancelAll()
 	stop := s.collectStop
 	s.mu.Unlock()
 
-	if previous == PhaseStopped && stop == nil {
-		return nil
-	}
 	// Shutdown is terminal either way: the phase stays stopped so nothing can
 	// revive this instance. The error only reports that the drain did not
-	// finish, which the host needs before it unloads. A repeated shutdown
-	// re-judges the same way Quiesce does, for the same reason.
+	// finish, which the host needs before it unloads.
+	//
+	// There is no "already stopped, therefore drained" shortcut. Being stopped
+	// only says new work is refused; a previous shutdown can have given up with
+	// a host call still running, and that call does not disappear because the
+	// phase changed.
 	return s.drain(stop)
 }
 
@@ -280,25 +295,53 @@ func (s *State) takeCollectorLocked() func() drainOutcome {
 //
 // It is the single place both Quiesce and Shutdown go through, so a repeat
 // call cannot answer from an inference (phase, or the absence of a stop
-// function) instead of from the actual in-flight set. A nil stop means this
-// instance never ran a collector; that is the one case where there is
-// nothing to judge and success is honest.
+// function) instead of from the actual in-flight set.
 //
-// The wait stays bounded by the collector's own budget, so a host that never
+// "No stop function" is NOT proof of an empty set. A stop can have been
+// replaced by a reconfigure, or installed after a quiesce had already
+// begun, and either way a callback it left running outlives it. Those stops
+// are kept in orphanDrains and re-judged on every call, so a drain can only
+// report success when EVERY stop this instance ever installed agrees nothing
+// is running.
+//
+// The wait stays bounded by each stop's own budget, so a host that never
 // returns still results in a clear failure rather than a wedged hot
 // replace.
 func (s *State) drain(stop func() drainOutcome) error {
 	s.mu.Lock()
 	s.drainAttempts++
+	orphans := append([]func() drainOutcome(nil), s.orphanDrains...)
 	s.mu.Unlock()
 
-	if stop == nil {
-		return nil
+	var failures []error
+	if stop != nil {
+		if outcome := stop(); !outcome.drained {
+			failures = append(failures, outcome.errDrainTimeout())
+		}
 	}
-	if outcome := stop(); !outcome.drained {
-		return outcome.errDrainTimeout()
+	for _, orphan := range orphans {
+		if outcome := orphan(); !outcome.drained {
+			failures = append(failures, outcome.errDrainTimeout())
+		}
 	}
-	return nil
+	return errors.Join(failures...)
+}
+
+// retainUndrainedLocked parks a stop whose drain did not finish, so a later
+// drain re-judges it even after the stop itself has been replaced.
+//
+// Only a FAILED drain is retained: a stop that reported success has no
+// in-flight call of its own left, and keeping it would make every future
+// drain re-wait on a dead collector.
+func (s *State) retainUndrainedLocked(stop func() drainOutcome, drained bool) {
+	if stop == nil || drained {
+		return
+	}
+	// Duplicate retention is harmless -- the stop is idempotent and would
+	// simply be judged twice -- but comparing func values is not possible in
+	// Go beyond a nil check, so callers rely on inserting each stop at most
+	// once by construction (Register and SetCollector each own one).
+	s.orphanDrains = append(s.orphanDrains, stop)
 }
 
 // DrainAttempts reports how many bounded drain judgements this instance has
@@ -364,5 +407,13 @@ func (s *State) SetCollector(stop func() drainOutcome) {
 		return
 	}
 	s.mu.Unlock()
-	stop()
+	// Installed onto an instance that is not accepting work: stop it at once.
+	// If that stop cannot finish, the work it leaves behind belongs to this
+	// instance and must stay visible to later drains; dropping the result here
+	// is the same false success as answering from the phase.
+	if outcome := stop(); !outcome.drained {
+		s.mu.Lock()
+		s.retainUndrainedLocked(stop, false)
+		s.mu.Unlock()
+	}
 }
