@@ -818,10 +818,13 @@ const (
 
 // parseDurationText sums "3h", "6 days" and "2 hours 30 minutes" style text.
 // The whole string must be consumed: a leading sign, a decimal or any leftover
-// word makes the parse fail, so "1.5 hours" is never read as "5 hours" and
-// "-3h" is never read as a positive three hours.
+// word makes the parse fail, so "1.5 hours" and ".5 hours" are never read as
+// five hours and "-3h" is never read as a positive three hours.
 func parseDurationText(value string) (time.Duration, bool) {
-	rest := trimResetNoise(value)
+	// Before the first token only whitespace is noise. A leading '.' or ',' is
+	// part of the number (".5 hours"), and stripping it would turn half an hour
+	// into five; leaving it makes reDurToken refuse the decimal instead.
+	rest := strings.TrimSpace(value)
 	if rest == "" {
 		return 0, false
 	}
@@ -859,6 +862,8 @@ func parseDurationText(value string) (time.Duration, bool) {
 
 // trimResetNoise drops the punctuation and the conjunction that separate one
 // duration token from the next ("2 hours, 30 minutes", "1 day and 6 hours").
+// It is only ever called after a token, never at the start of the text, so a
+// decimal point that belongs to a number is never mistaken for a separator.
 // Anything else stops the trim, so a word the parser does not understand is left
 // in place for reDurToken to refuse rather than skipped quietly.
 func trimResetNoise(value string) string {

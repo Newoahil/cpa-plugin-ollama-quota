@@ -367,8 +367,8 @@ func endpointOf(source Source) string {
 // consumed; included.balance_usd is the remaining included credit and
 // included.allowance_usd is the credit the period started with. Legacy plans
 // return included.session/included.weekly instead, which are read as windows.
-func (c *Client) fetchBalance(ctx context.Context, apiKey string, now time.Time) (Snapshot, error) {
-	snapshot := Snapshot{ObservedAt: now, Source: SourceBalance}
+func (c *Client) fetchBalance(ctx context.Context, apiKey string, now time.Time) (snapshot Snapshot, err error) {
+	snapshot = Snapshot{ObservedAt: now, Source: SourceBalance}
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.balanceURL, nil)
 	if err != nil {
@@ -384,7 +384,16 @@ func (c *Client) fetchBalance(ctx context.Context, apiKey string, now time.Time)
 	if err != nil {
 		return snapshot, err
 	}
-	defer drainClose(response.Body)
+	// A body that panics while it is being drained or closed has not finished
+	// delivering the payload the reading was parsed from, so the reading is
+	// withdrawn rather than returned. An earlier failure is kept as is: it
+	// already carries no figures.
+	defer func() {
+		if closeErr := drainClose("balance", response.Body); closeErr != nil && err == nil {
+			snapshot = unavailable(now, SourceBalance)
+			err = closeErr
+		}
+	}()
 
 	switch status := response.StatusCode; {
 	case status == http.StatusOK:
@@ -412,8 +421,8 @@ func (c *Client) fetchBalance(ctx context.Context, apiKey string, now time.Time)
 }
 
 // fetchSettings reads and parses the settings page (SPEC 3.2 path two).
-func (c *Client) fetchSettings(ctx context.Context, cookie string, now time.Time) (Snapshot, error) {
-	snapshot := Snapshot{ObservedAt: now, Source: SourceSettings}
+func (c *Client) fetchSettings(ctx context.Context, cookie string, now time.Time) (snapshot Snapshot, err error) {
+	snapshot = Snapshot{ObservedAt: now, Source: SourceSettings}
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.settingsURL, nil)
 	if err != nil {
@@ -429,7 +438,12 @@ func (c *Client) fetchSettings(ctx context.Context, cookie string, now time.Time
 	if err != nil {
 		return snapshot, err
 	}
-	defer drainClose(response.Body)
+	defer func() {
+		if closeErr := drainClose("settings", response.Body); closeErr != nil && err == nil {
+			snapshot = unavailable(now, SourceSettings)
+			err = closeErr
+		}
+	}()
 
 	switch status := response.StatusCode; {
 	case status == http.StatusOK:
@@ -610,14 +624,38 @@ func readBounded(body io.Reader, limit int64) ([]byte, error) {
 }
 
 // drainClose consumes a bounded remainder so the connection can be reused, then
-// closes the body. Fetch's recovery already covers this, but a panicking Read
-// would otherwise be caught only at the top and lose the endpoint context, so
-// the drain swallows its own panic.
-func drainClose(body io.ReadCloser) {
+// closes the body. A panic in either step is returned as a network-class error
+// instead of being swallowed: the body never finished, so whatever was parsed
+// from it is not a reading (SPEC 4.4).
+//
+// Close runs even when the drain panics, in its own recovery, so a panicking
+// Read cannot cost the connection its Close. When both panic, the Read panic is
+// reported because it is the one that says the payload was incomplete.
+func drainClose(endpoint string, body io.ReadCloser) (err error) {
 	if body == nil {
-		return
+		return nil
 	}
-	defer func() { _ = recover() }()
-	_, _ = io.Copy(io.Discard, io.LimitReader(body, 1<<20))
-	_ = body.Close()
+	drainErr := recoverAsError(endpoint, "drained", func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(body, 1<<20))
+	})
+	closeErr := recoverAsError(endpoint, "closed", func() { _ = body.Close() })
+	if drainErr != nil {
+		return drainErr
+	}
+	return closeErr
+}
+
+// recoverAsError runs one cleanup step under panic recovery and turns a panic
+// into an error naming the endpoint and what was being done to the body. The
+// recovered value is never used: a body handed back by a transport can panic
+// with any value, and its text must not reach an error string.
+func recoverAsError(endpoint, action string, run func()) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = newError(KindNetwork, endpoint, 0,
+				fmt.Sprintf("the Ollama %s response body panicked while it was being %s", endpoint, action))
+		}
+	}()
+	run()
+	return nil
 }

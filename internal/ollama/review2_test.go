@@ -237,19 +237,91 @@ func TestReviewBodyReadPanicRecovered(t *testing.T) {
 	assertPanicContained(t, NewClient(WithTransport(transport)), Credential{APIKey: canaryAPIKey})
 }
 
-// reviewPanicCloseBody panics only on Close.
-type reviewPanicCloseBody struct{}
+// reviewPanicCloseBody serves a complete, valid payload and panics only on
+// Close. An empty body would fail to parse first, which would hide a swallowed
+// Close panic behind an unrelated failure.
+type reviewPanicCloseBody struct {
+	reader io.Reader
+}
 
-func (reviewPanicCloseBody) Read(buffer []byte) (int, error) { return 0, io.EOF }
-func (reviewPanicCloseBody) Close() error                    { panic("body close panic") }
+func (b *reviewPanicCloseBody) Read(buffer []byte) (int, error) { return b.reader.Read(buffer) }
+func (*reviewPanicCloseBody) Close() error                     { panic("body close panic") }
+
+// reviewValidPayloads are bodies each endpoint parses into a reading, so the
+// only thing that can fail the attempt is the body's own cleanup.
+var reviewValidPayloads = []struct {
+	name       string
+	body       string
+	credential Credential
+}{
+	{"balance", `{"included":{"balance_usd":12.4}}`, Credential{APIKey: canaryAPIKey}},
+	{"settings", `<div>Session usage</div><div>20% used</div>`, Credential{Cookie: canaryCookie}},
+}
 
 // TestReviewBodyClosePanicRecovered pins R4 for Body.Close, which runs in a
-// deferred drainClose after a successful read.
+// deferred cleanup after a successful read: the valid payload must not be
+// reported as a reading when Close panics. Both fetch paths are covered, since
+// each defers its own cleanup.
 func TestReviewBodyClosePanicRecovered(t *testing.T) {
+	for _, testCase := range reviewValidPayloads {
+		t.Run(testCase.name, func(t *testing.T) {
+			payload := testCase.body
+			transport := transportFunc(func(*http.Request) (*http.Response, error) {
+				body := &reviewPanicCloseBody{reader: strings.NewReader(payload)}
+				return &http.Response{StatusCode: http.StatusOK, Body: body}, nil
+			})
+			snapshot, err := NewClient(WithTransport(transport)).Fetch(context.Background(), testCase.credential)
+			if err == nil {
+				t.Fatalf("Fetch err = nil after Body.Close panicked; snapshot = %s", snapshotDump(t, snapshot))
+			}
+			if snapshot.HasData() {
+				t.Errorf("a Close panic still returned figures: %s", snapshotDump(t, snapshot))
+			}
+			if snapshot.Status != StatusUnavailable {
+				t.Errorf("status = %q, want %q", snapshot.Status, StatusUnavailable)
+			}
+			if KindOf(err) != KindNetwork {
+				t.Errorf("kind = %q, want %q", KindOf(err), KindNetwork)
+			}
+			assertNoSecrets(t, "close panic error", err.Error())
+		})
+	}
+}
+
+// reviewPanicDrainBody serves one chunk, then panics on the next Read so the
+// deferred drain is the thing that blows up, and records whether Close still
+// ran: a panicking drain must not cost the body its Close.
+type reviewPanicDrainBody struct {
+	reads  int
+	closed *bool
+}
+
+func (b *reviewPanicDrainBody) Read(buffer []byte) (int, error) {
+	b.reads++
+	if b.reads == 1 {
+		return copy(buffer, "x"), nil
+	}
+	panic("body drain panic")
+}
+func (b *reviewPanicDrainBody) Close() error { *b.closed = true; return nil }
+
+// TestReviewBodyDrainPanicStillCloses pins the other half of R4: when the drain
+// panics, Close is still attempted and the result is a failure.
+func TestReviewBodyDrainPanicStillCloses(t *testing.T) {
+	closed := false
 	transport := transportFunc(func(*http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: http.StatusOK, Body: reviewPanicCloseBody{}}, nil
+		return &http.Response{StatusCode: http.StatusOK, Body: &reviewPanicDrainBody{closed: &closed}}, nil
 	})
-	assertPanicContained(t, NewClient(WithTransport(transport)), Credential{APIKey: canaryAPIKey})
+	snapshot, err := NewClient(WithTransport(transport)).Fetch(context.Background(), Credential{APIKey: canaryAPIKey})
+	if err == nil {
+		t.Fatalf("Fetch err = nil after the body drain panicked; snapshot = %s", snapshotDump(t, snapshot))
+	}
+	if snapshot.HasData() {
+		t.Errorf("a drain panic still returned figures: %s", snapshotDump(t, snapshot))
+	}
+	if !closed {
+		t.Error("Close was not attempted after the drain panicked")
+	}
 }
 
 // TestReviewClockPanicRecovered pins R4 for the earliest thing Fetch does.
@@ -549,11 +621,46 @@ func TestReviewNegativeDuration(t *testing.T) {
 	}
 }
 
-// TestDurationRejectsDecimals pins R9 for "1.5 hours", which the digit scan used
+// TestDurationDecimalRefused pins R9 for "1.5 hours", which the digit scan used
 // to read as "5 hours".
 func TestDurationDecimalRefused(t *testing.T) {
 	if duration, ok := parseDurationText("1.5 hours"); ok {
 		t.Fatalf("parseDurationText(\"1.5 hours\") = %v, true; want a refusal", duration)
+	}
+}
+
+// TestDurationRefusesLeadingDecimal pins R9 for ".5 hours": a leading trim that
+// strips the point reads half an hour as five.
+func TestDurationRefusesLeadingDecimal(t *testing.T) {
+	for _, value := range []string{".5 hours", " .5 hours", ".5h", ".25 days", "\t.5 hours"} {
+		duration, ok := parseDurationText(value)
+		if !ok {
+			continue
+		}
+		if duration == 5*time.Hour {
+			t.Fatalf("parseDurationText(%q) = %v, true; a leading decimal must not become five hours", value, duration)
+		}
+		t.Fatalf("parseDurationText(%q) = %v, true; want a refusal", value, duration)
+	}
+}
+
+// TestResetLeadingDecimalRefusedThroughParseSettings pins R9 for the whole page:
+// "Resets in .5 hours" must not become a reset five hours out.
+func TestResetLeadingDecimalRefusedThroughParseSettings(t *testing.T) {
+	now := time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC)
+	parsed, err := ParseSettings(`<section>Session usage 20%<p>Resets in .5 hours</p></section>`, now)
+	if err != nil {
+		t.Fatalf("ParseSettings: %v", err)
+	}
+	fiveHour, ok := findWindow(parsed, WindowFiveHour)
+	if !ok || fiveHour.UsedPercent != 20 {
+		t.Fatalf("5h window = %+v, want used 20", fiveHour)
+	}
+	if fiveHour.ResetAt != nil {
+		t.Fatalf("ResetAt = %s, want no reset derived from a decimal", fiveHour.ResetAt)
+	}
+	if fiveHour.ResetText != ".5 hours" {
+		t.Errorf("ResetText = %q, want the unparsed text kept verbatim", fiveHour.ResetText)
 	}
 }
 
