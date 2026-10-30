@@ -109,6 +109,11 @@ func (s *State) Register(configYAML []byte) (Config, error) {
 //
 // The phase change and the provider cancellation happen under one lock. The
 // collector stop is taken under the lock and invoked after it is released.
+//
+// After the cancellation, Quiesce waits for tracked fetches to finish, so that
+// by the time it returns nothing of ours is still executing — the host dlcloses
+// the library right after a successful quiesce (SPEC 4.1). The wait is bounded
+// so a fetch that ignores cancellation cannot wedge a hot swap forever.
 func (s *State) Quiesce() Phase {
 	s.mu.Lock()
 	previous := s.phase
@@ -118,12 +123,14 @@ func (s *State) Quiesce() Phase {
 	}
 	s.phase = PhaseQuiescing
 	stop := s.takeCollectorLocked()
-	s.provider.CancelAll()
+	provider := s.provider
+	provider.CancelAll()
 	s.mu.Unlock()
 
 	if stop != nil {
 		stop()
 	}
+	provider.drain(drainTimeout)
 	return previous
 }
 
@@ -136,12 +143,14 @@ func (s *State) Shutdown() {
 	}
 	s.phase = PhaseStopped
 	stop := s.takeCollectorLocked()
-	s.provider.CancelAll()
+	provider := s.provider
+	provider.CancelAll()
 	s.mu.Unlock()
 
 	if stop != nil {
 		stop()
 	}
+	provider.drain(drainTimeout)
 }
 
 // takeCollectorLocked detaches the collector stop function so it is called

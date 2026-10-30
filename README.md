@@ -142,6 +142,8 @@ scripts/build.sh --go               # 用本机的 Go 和 C 工具链编译当�
 
 - [需求 SPEC](docs/spec.md)
 - [编排配置](docs/agents/orchestration.md)
+- [热插拔实测](docs/hotswap-verification.md)——升级插件不重启 CPA 的实测报告，脚本是
+  `scripts/verify-hotswap.sh`
 
 ## 许可
 

@@ -3,7 +3,15 @@ package quotaplugin
 import (
 	"context"
 	"sync"
+	"time"
 )
+
+// drainTimeout bounds how long quiesce waits for tracked fetches to finish.
+// A collection is itself bounded by the client's 20s timeout (SPEC 4.4), and
+// cancellation is cooperative, so this only has to cover the gap between a
+// cancelled fetch and its release; five seconds is generous for that while
+// staying well inside any host-side unload timeout.
+const drainTimeout = 5 * time.Second
 
 // Provider is the #1 placeholder implementation of pluginapi.QuotaProvider.
 //
@@ -14,6 +22,12 @@ type Provider struct {
 	mu      sync.Mutex
 	cancels map[uint64]context.CancelFunc
 	nextID  uint64
+	// inflight counts tracked work whose release has not run yet. Quiesce waits
+	// on it so "quiesce returned" means "nothing of ours is still running", not
+	// merely "the cancel signals were sent" (SPEC 4.1). Add only happens under
+	// mu while cancels is non-nil, and CancelAll clears cancels under mu, so a
+	// wait started after CancelAll cannot race a late Add.
+	inflight sync.WaitGroup
 }
 
 // NewProvider returns a provider ready to serve; register re-arms it after a
@@ -78,15 +92,20 @@ func (p *Provider) Track(ctx context.Context) (context.Context, func(), bool) {
 	p.nextID++
 	id := p.nextID
 	p.cancels[id] = cancel
+	p.inflight.Add(1)
 	p.mu.Unlock()
 
 	release := func() {
 		p.mu.Lock()
-		if entry, ok := p.cancels[id]; ok {
+		entry, ok := p.cancels[id]
+		if ok {
 			delete(p.cancels, id)
-			entry()
 		}
 		p.mu.Unlock()
+		if ok {
+			entry()
+		}
+		p.inflight.Done()
 	}
 	return trackedCtx, release, true
 }
@@ -100,6 +119,29 @@ func (p *Provider) CancelAll() {
 
 	for _, cancel := range cancels {
 		cancel()
+	}
+}
+
+// drain waits for every tracked fetch to call its release, bounded by timeout.
+// It reports whether the drain finished; on false some work is still running
+// and the caller must not let the host unload the library.
+//
+// It must only be called after CancelAll: Add is only reachable under mu while
+// cancels is non-nil, and CancelAll clears cancels under mu, so no Add can
+// start after a drain begins.
+func (p *Provider) drain(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		p.inflight.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
 	}
 }
 
