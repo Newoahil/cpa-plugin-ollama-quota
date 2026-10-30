@@ -87,9 +87,18 @@ const (
 // Balance is a credit figure with its currency. The documented endpoints
 // report US dollars; Currency is carried so the display layer never has to
 // assume a symbol.
+//
+// Amount is the credit the account can actually spend: the included plan credit
+// plus any purchased credit. Included and Purchased keep the split when upstream
+// reported it, so a page can say "$0.00 included, $12.40 purchased" while the
+// exhaustion check still sees the $12.40 (SPEC 3.1, AC-2).
 type Balance struct {
 	Amount   float64 `json:"amount"`
 	Currency string  `json:"currency"`
+	// Included is the remaining plan credit, when upstream reported it.
+	Included *float64 `json:"included,omitempty"`
+	// Purchased is the remaining bought credit, when upstream reported it.
+	Purchased *float64 `json:"purchased,omitempty"`
 }
 
 // Valid reports whether the amount is a finite, non-negative figure. A value
@@ -184,6 +193,10 @@ func (s Snapshot) Window(name string) (Window, bool) {
 
 // deriveStatus computes the display status for a snapshot that carries a
 // reading. An empty snapshot is unavailable.
+//
+// A zero *available* balance is exhausted. Balance.Amount is the total the
+// account can spend, so having spent the included credit while purchased credit
+// remains is not exhausted (SPEC 3.1, AC-2).
 func (s Snapshot) deriveStatus(warningPercent float64) Status {
 	if !s.HasData() {
 		return StatusUnavailable

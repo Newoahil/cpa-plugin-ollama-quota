@@ -57,10 +57,13 @@ type Error struct {
 	// HasRetryAfter reports whether RetryAfter was communicated upstream.
 	HasRetryAfter bool `json:"has_retry_after,omitempty"`
 
-	// cause keeps the underlying transport error reachable through errors.Is
-	// for deadline and cancellation checks. It is never folded into Message,
-	// because a *url.Error carries the request URL.
-	cause error
+	// sentinel is the only error an Error chains to: context.Canceled or
+	// context.DeadlineExceeded, or nil. The raw transport error is deliberately
+	// never kept — a *url.Error carries the request URL and any error an
+	// injected transport returns may carry the credential verbatim, so exposing
+	// it through Unwrap would make the secret reachable even though the message
+	// is clean (SPEC 4.2).
+	sentinel error
 }
 
 // Error implements error.
@@ -71,19 +74,23 @@ func (e *Error) Error() string {
 	return e.Message
 }
 
-// Unwrap exposes both the class sentinel and the underlying cause, so all of
-// these work:
+// Unwrap exposes the class sentinel and, when the failure was a cancellation or
+// a deadline, that standard sentinel too — so all of these work:
 //
 //	errors.Is(err, ollama.ErrRateLimit)
 //	errors.Is(err, context.DeadlineExceeded)
 //	var failure *ollama.Error; errors.As(err, &failure)
+//
+// Nothing from the transport is chained. Every element Unwrap can return is a
+// package constant or a context sentinel, so walking the chain can never yield
+// credential material (SPEC 4.2).
 func (e *Error) Unwrap() []error {
 	if e == nil {
 		return nil
 	}
 	errs := []error{e.Kind.sentinel()}
-	if e.cause != nil {
-		errs = append(errs, e.cause)
+	if e.sentinel != nil {
+		errs = append(errs, e.sentinel)
 	}
 	return errs
 }
@@ -225,17 +232,24 @@ func isLoginPath(path string) bool {
 	return false
 }
 
-// networkError classifies a transport failure. The cause stays reachable
-// through errors.Is (for context.DeadlineExceeded and context.Canceled) while
-// the message remains a constant that cannot echo a URL.
+// networkError classifies a transport failure. The message is a constant chosen
+// from the error's shape, and the only thing kept for errors.Is is the
+// cancellation or deadline sentinel — the error value itself is dropped, so a
+// transport that puts the credential in its error text cannot leak it through
+// the returned chain (SPEC 4.2).
 func networkError(endpoint string, err error) *Error {
-	return &Error{
-		Kind:          KindNetwork,
-		Endpoint:      endpoint,
-		Message:       networkMessage(endpoint, err),
-		HasRetryAfter: false,
-		cause:         err,
+	failure := &Error{
+		Kind:     KindNetwork,
+		Endpoint: endpoint,
+		Message:  networkMessage(endpoint, err),
 	}
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		failure.sentinel = context.DeadlineExceeded
+	case errors.Is(err, context.Canceled):
+		failure.sentinel = context.Canceled
+	}
+	return failure
 }
 
 func networkMessage(endpoint string, err error) string {

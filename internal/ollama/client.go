@@ -132,11 +132,12 @@ func WithClock(now func() time.Time) Option {
 	}
 }
 
-// WithEndpoints points the client at a test fixture server. It is unexported
-// from production's perspective: both URLs must share one host, and that host
-// becomes the only one a request may reach. Production never calls it, so the
-// compiled default is always the fixed ollama.com origin.
-func WithEndpoints(balanceURL, settingsURL string) Option {
+// endpoints points a client at a fixture server. It is unexported and only
+// reachable from this package's tests, because a production caller must never
+// be able to change the origin: the credential is only ever sent to the fixed
+// ollama.com host (SPEC 4.2). Both URLs must share one host, and that host
+// becomes the only one a request may reach.
+func endpoints(balanceURL, settingsURL string) Option {
 	return func(c *Client) {
 		balance, err := url.Parse(strings.TrimSpace(balanceURL))
 		if err != nil || balance.Host == "" {
@@ -197,9 +198,10 @@ func originOf(rawURL string) string {
 	return parsed.Scheme + "://" + parsed.Host
 }
 
-// Fetch collects one account's quota. It never panics: a panic in a transport
-// is recovered and returned as a network-class error, because this code runs
-// inside the CPA process (SPEC 4.4).
+// Fetch collects one account's quota. It never panics: this code runs inside
+// the CPA process, where a panic on a collection goroutine can take the gateway
+// down (SPEC 4.4). The recovery covers the whole collection — transport, body
+// read, body close and parsing — not just the transport call.
 //
 // The returned Snapshot is always usable: on failure it has StatusUnavailable
 // and no figures, and the error classifies why. Order of paths (SPEC 3.2):
@@ -210,11 +212,47 @@ func originOf(rawURL string) string {
 //
 // A settings reading that only yields a plan and a balance is not a quota read
 // and is not reported as success (see ParseSettings).
-func (c *Client) Fetch(ctx context.Context, credential Credential) (Snapshot, error) {
+//
+// Whatever the path produced is checked against the credential one last time: a
+// page that echoes the key or the cookie is refused rather than returned, since
+// SPEC 4.2 forbids the secret reaching a caller through a value as much as
+// through an error string.
+func (c *Client) Fetch(ctx context.Context, credential Credential) (snapshot Snapshot, err error) {
+	// The timestamp is read behind its own recovery so a broken clock still
+	// yields a snapshot an operator can place in time.
+	observedAt := c.safeNow()
+	// The recovery converts a panic anywhere below — the transport, Body.Read,
+	// Body.Close, the parser — into a failure with no figures. Returning the
+	// zero Snapshot instead would carry Status "" and no ObservedAt, which a
+	// display layer cannot tell from a reading.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			snapshot = unavailable(observedAt, SourceNone)
+			err = newError(KindNetwork, "", 0,
+				fmt.Sprintf("the Ollama collection panicked: %T", recovered))
+		}
+	}()
+
+	snapshot, err = c.fetch(ctx, credential, observedAt)
+	return rejectEcho(snapshot, err, credential)
+}
+
+// safeNow calls the injected clock, falling back to the wall clock if it panics,
+// so ObservedAt is always a real instant.
+func (c *Client) safeNow() (observedAt time.Time) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			observedAt = time.Now()
+		}
+	}()
+	return c.now()
+}
+
+// fetch is the body of Fetch; Fetch adds the panic boundary around it.
+func (c *Client) fetch(ctx context.Context, credential Credential, now time.Time) (snapshot Snapshot, err error) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
-	now := c.now()
 	if credential.Empty() {
 		return unavailable(now, SourceNone), ErrMissingCredential
 	}
@@ -262,6 +300,67 @@ func (c *Client) Fetch(ctx context.Context, credential Credential) (Snapshot, er
 		return unavailable(now, SourceBalance), firstErr
 	}
 	return unavailable(now, SourceNone), ErrMissingCredential
+}
+
+// rejectEcho is the last check before a reading leaves the package. Any field
+// that can carry upstream text — the reset wording, the plan — is scanned for
+// the credential this attempt used; a hit turns the whole reading into a parse
+// failure with no figures. Substituting an empty string would leave a reading
+// the page did not verify, so the result is refused instead (SPEC 4.2, 4.3).
+func rejectEcho(snapshot Snapshot, err error, credential Credential) (Snapshot, error) {
+	if err != nil {
+		return snapshot, err
+	}
+	if echoesCredential(snapshot, credential) {
+		return unavailable(snapshot.ObservedAt, snapshot.Source), newError(KindParse, endpointOf(snapshot.Source), 0,
+			"the Ollama response echoed the credential back; the reading was discarded rather than returned")
+	}
+	return snapshot, nil
+}
+
+// echoesCredential reports whether any echoable field of the snapshot contains
+// a credential fragment.
+func echoesCredential(snapshot Snapshot, credential Credential) bool {
+	secrets := []string{
+		strings.TrimSpace(credential.APIKey),
+		strings.TrimSpace(credential.Cookie),
+		cookieValue(credential.Cookie),
+	}
+	values := []string{snapshot.Plan}
+	for _, window := range snapshot.Windows {
+		values = append(values, window.Label, window.ResetText)
+	}
+	for _, secret := range secrets {
+		if secret == "" {
+			continue
+		}
+		for _, value := range values {
+			if strings.Contains(value, secret) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// cookieValue is the value half of a cookie credential, so a page that echoes
+// only the session token (not the full "name=value" pair) is still caught.
+func cookieValue(cookie string) string {
+	trimmed := strings.TrimSpace(cookie)
+	if trimmed == "" {
+		return ""
+	}
+	if at := strings.IndexByte(trimmed, '='); at >= 0 {
+		return strings.TrimSpace(trimmed[at+1:])
+	}
+	return trimmed
+}
+
+func endpointOf(source Source) string {
+	if source == SourceSettings {
+		return "settings"
+	}
+	return "balance"
 }
 
 // fetchBalance reads the balance endpoint. Only the documented fields are
@@ -437,6 +536,12 @@ func rateLimited(endpoint string, header http.Header) *Error {
 	return failure
 }
 
+// maxRetryAfterSeconds bounds a delay-seconds value before it is multiplied.
+// Multiplying an Atoi-sized integer by time.Second overflows int64 into a
+// negative duration, and a negative clamp means "retry immediately" — the exact
+// opposite of what upstream asked for.
+const maxRetryAfterSeconds = int64(24 * 60 * 60)
+
 // parseRetryAfter reads the Retry-After header, accepting delay-seconds and an
 // HTTP date, bounded to one day so a hostile value cannot park an account
 // indefinitely.
@@ -453,11 +558,14 @@ func parseRetryAfter(header http.Header) (time.Duration, bool) {
 			if value == "" {
 				continue
 			}
-			if seconds, err := strconv.Atoi(value); err == nil {
+			if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
 				if seconds < 0 {
 					continue
 				}
-				return clampBackoff(time.Duration(seconds) * time.Second), true
+				if seconds > maxRetryAfterSeconds {
+					return 24 * time.Hour, true
+				}
+				return time.Duration(seconds) * time.Second, true
 			}
 			if when, err := http.ParseTime(value); err == nil {
 				return clampBackoff(time.Until(when)), true
@@ -502,11 +610,14 @@ func readBounded(body io.Reader, limit int64) ([]byte, error) {
 }
 
 // drainClose consumes a bounded remainder so the connection can be reused, then
-// closes the body.
+// closes the body. Fetch's recovery already covers this, but a panicking Read
+// would otherwise be caught only at the top and lose the endpoint context, so
+// the drain swallows its own panic.
 func drainClose(body io.ReadCloser) {
 	if body == nil {
 		return
 	}
+	defer func() { _ = recover() }()
 	_, _ = io.Copy(io.Discard, io.LimitReader(body, 1<<20))
 	_ = body.Close()
 }

@@ -22,7 +22,7 @@ const (
 )
 
 // fixture is a loopback server that stands in for ollama.com. Each test wires
-// the handlers it needs; the client is pointed at it with WithEndpoints.
+// the handlers it needs; the client is pointed at it with the endpoints option.
 type fixture struct {
 	server *httptest.Server
 	mu     sync.Mutex
@@ -83,7 +83,7 @@ func (f *fixture) settings(fn http.HandlerFunc) { f.mu.Lock(); f.settingsHandler
 func (f *fixture) client(options ...Option) *Client {
 	base := f.server.URL
 	all := append([]Option{
-		WithEndpoints(base+"/api/balance", base+"/settings"),
+		endpoints(base+"/api/balance", base+"/settings"),
 	}, options...)
 	return NewClient(all...)
 }
@@ -371,23 +371,28 @@ func TestParseSettingsOutOfRangeRefused(t *testing.T) {
 	}
 }
 
-// TestParseSettingsNoCrossWindowLeak pins that a percentage sitting between two
-// labels is never attributed to the window whose label is farther away: doing
-// so would display a real-but-wrong number, which SPEC 4.3 forbids.
+// TestParseSettingsNoCrossWindowLeak pins that a percentage shared by two
+// labels is refused rather than attributed to one of them: either attribution
+// would display a real-but-wrong number for one window, which SPEC 4.3 forbids.
+//
+// This replaces the previous expectation, which accepted the reading when the
+// weekly window (named on the page) silently disappeared with the five-hour
+// window's figure. That was the partial-success bug R6 reports, so the page now
+// has to fail as a whole.
 func TestParseSettingsNoCrossWindowLeak(t *testing.T) {
-	// Flattened, this is three lines: the 5h label, one percentage shared by
-	// both, and the weekly label. The percentage is adjacent to the 5h label
-	// first, but a naive ±3-line scan would report it for the weekly window too.
+	// The 5h label, one percentage, and the weekly label sit in three sibling
+	// divs. The percentage is under no label's own element, so it is not claimed
+	// by either window; the weekly window is named but unreadable.
 	page := `<div><span>Session usage</span></div><div><span>40% used</span></div><div><span>Weekly usage</span></div>`
 	parsed, err := ParseSettings(page, time.Now())
-	if err != nil {
-		t.Fatalf("ParseSettings: %v", err)
+	if err == nil {
+		t.Fatalf("ParseSettings err = nil; a shared percentage must not be assigned to either window: %+v", parsed)
 	}
-	if len(parsed.Windows) != 1 {
-		t.Fatalf("windows = %+v, want exactly 1 (the weekly window has no percentage of its own)", parsed.Windows)
+	if KindOf(err) != KindParse {
+		t.Errorf("kind = %q, want %q", KindOf(err), KindParse)
 	}
-	if parsed.Windows[0].Name != WindowFiveHour || parsed.Windows[0].UsedPercent != 40 {
-		t.Fatalf("window = %+v, want the 5h window at 40%%", parsed.Windows[0])
+	if len(parsed.Windows) != 0 || parsed.Balance != nil || parsed.Plan != "" {
+		t.Errorf("a refused parse must expose nothing: %+v", parsed)
 	}
 }
 
