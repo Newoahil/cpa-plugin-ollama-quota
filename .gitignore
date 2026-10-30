@@ -1,0 +1,8 @@
+dist/
+*.so
+*.dylib
+*.dll
+*.h
+.env
+.env.local
+.orchestration/
