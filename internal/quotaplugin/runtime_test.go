@@ -165,10 +165,12 @@ func TestRuntimeShutdownIsIdempotent(t *testing.T) {
 	}
 }
 
-// The host issues one shutdown per init, and a replacement's retired client is
-// shut down after the replacement is live. Matching shutdowns to generations
-// oldest first is what makes that late call land on the retired generation
-// instead of the one now serving.
+// The host issues one shutdown per init, and FIFO spends one live generation
+// per shutdown it receives. This test drives the synthetic "old client first"
+// order: the retired client's shutdown arrives before the live client's own.
+// The host does not actually order them this way — it closes the active client
+// first — so TestRuntimeShutdownAfterReplacementKeepsNewestServing pins the
+// property that has to hold under either order.
 func TestRuntimeShutdownRetiresOldestGeneration(t *testing.T) {
 	runtime := NewRuntime()
 
@@ -213,6 +215,66 @@ func TestRuntimeShutdownRetiresOldestGeneration(t *testing.T) {
 	}
 	if live := runtime.LiveGenerations(); live != 0 {
 		t.Fatalf("live generations = %d, want 0", live)
+	}
+}
+
+// Under the host's real unload order the active client is shut down before the
+// retired ones, so the first shutdown a replacement's queue receives can belong
+// to the generation that is currently serving. The ABI cannot tell which
+// generation a shutdown belongs to, so this test asserts only the property that
+// must hold under either order: after one shutdown the newest generation is
+// still serving, and the second shutdown leaves nothing live. It deliberately
+// does not assert which generation the first shutdown retired.
+func TestRuntimeShutdownAfterReplacementKeepsNewestServing(t *testing.T) {
+	runtime := NewRuntime()
+
+	first := runtime.Init()
+	if _, err := first.Handle(pluginabi.MethodPluginRegister, registerPayload(t, enabledConfig)); err != nil {
+		t.Fatalf("first register: %v", err)
+	}
+	second := runtime.Init()
+	if _, err := second.Handle(pluginabi.MethodPluginRegister, registerPayload(t, enabledConfig)); err != nil {
+		t.Fatalf("second register: %v", err)
+	}
+	if live := runtime.LiveGenerations(); live != 2 {
+		t.Fatalf("live generations = %d, want 2", live)
+	}
+
+	// First shutdown of an unload sequence. Whichever generation it retires, the
+	// newest one has to keep serving.
+	runtime.Shutdown()
+
+	if newest := runtime.Current(); newest != second {
+		t.Fatal("Current must still be the newest generation while it is live")
+	}
+	if phase := second.State().Phase(); phase != PhaseActive {
+		t.Fatalf("newest phase after first shutdown = %s, want active", phase)
+	}
+	if _, ok := second.State().Provider(); !ok {
+		t.Fatal("the newest generation must keep its provider after the first shutdown")
+	}
+	if raw, err := second.Handle(pluginabi.MethodPluginRegister, registerPayload(t, enabledConfig)); err != nil {
+		t.Fatalf("register on the newest generation: %v", err)
+	} else if envelope := decodeEnvelope(t, raw); !envelope.OK {
+		t.Fatalf("the newest generation must still accept a register: %+v", envelope.Error)
+	}
+	if raw, err := second.Handle(pluginabi.MethodQuotaFetch, []byte(`{"provider":"ollama"}`)); err != nil {
+		t.Fatalf("fetch on the newest generation: %v", err)
+	} else if envelope := decodeEnvelope(t, raw); !envelope.OK {
+		t.Fatalf("the newest generation must still fetch after the first shutdown: %+v", envelope.Error)
+	}
+
+	// The second shutdown drains the queue; whatever the first one retired, all
+	// generations end stopped.
+	runtime.Shutdown()
+	if live := runtime.LiveGenerations(); live != 0 {
+		t.Fatalf("live generations = %d, want 0", live)
+	}
+	if phase := second.State().Phase(); phase != PhaseStopped {
+		t.Fatalf("newest phase after second shutdown = %s, want stopped", phase)
+	}
+	if phase := first.State().Phase(); phase != PhaseStopped {
+		t.Fatalf("oldest phase after second shutdown = %s, want stopped", phase)
 	}
 }
 

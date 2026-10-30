@@ -3,7 +3,8 @@ package quotaplugin
 import "sync"
 
 // Runtime owns the handlers of every ABI generation the host has initialised in
-// this process and decides which generation a call belongs to.
+// this process. A call is served by the newest generation; a shutdown retires
+// the oldest live one.
 //
 // Generations exist because Go package state survives dlclose: the host dlopens
 // the library, calls cliproxy_plugin_init, and on unload calls the plugin's
@@ -15,33 +16,62 @@ import "sync"
 // cliproxy_plugin_shutdown carry no pointer to the generation they belong to.
 // The ABI hands cliproxy_plugin_init a host pointer, but neither of the other
 // entry points receives it, there is no epoch on the call path, and a C function
-// pointer cannot close over per-init state — so the plugin cannot tag a call
-// with the generation that issued it. The one identity the host does provide is
-// the *number and order* of its ABI calls: one cliproxy_plugin_init per loaded
-// client, and exactly one cliproxy_plugin_shutdown per client (loader_unix.go
-// and loader_windows.go nil the shutdown pointer after invoking it, and
-// guardedPluginClient dedupes the call). Shutdowns are therefore matched to
-// generations in init order: the k-th shutdown retires the k-th generation that
-// init created, and a shutdown with nothing left to retire is a no-op.
+// pointer cannot close over per-init state — so the plugin cannot tag a call, or
+// a shutdown, with the generation that issued it. There is no instance identity
+// to recover here.
 //
-// The host's real ordering (measured against CLIProxyAPI v8.0.47, see
-// .orchestration/run_b5727398c1ca/reports/fix-3.md) is what makes that safe:
+// What the host does provide is a count: one cliproxy_plugin_init per loaded
+// client, and exactly one cliproxy_plugin_shutdown per successfully loaded
+// client (loader_unix.go and loader_windows.go nil the shutdown pointer after
+// invoking it, and guardedPluginClient dedupes the call). Retiring the oldest
+// live generation on every shutdown keeps one live handler per unspent
+// shutdown, which is what makes the queue work.
 //
-//   - hot replacement: plugin.quiesce(old) → init(new) → plugin.register(new).
-//     The retired client is not shut down during the swap. It is shut down later
-//     by UnloadPlugin/ShutdownAll, which shut down the active client first and
-//     the retired ones after it, so every generation gets exactly one shutdown.
-//   - unload + reinstall: shutdown(old) → … → init(new).
+// FIFO is a strategy that holds under the host lifecycle measured against
+// CLIProxyAPI v8.0.47 — not a binding of each shutdown call to the generation
+// that issued it. The host does not shut generations down in init order: on
+// unload it closes the active client first and the retired ones after it, and a
+// failed replacement closes the candidate first. That mismatched order is fine
+// because of what each path actually needs (reports/review-1d.md in the
+// orchestration run):
 //
-// Retiring in init order is what keeps the retired generation's late shutdown
-// from stopping the live one: the call that arrives after a replacement retires
-// the generation that was already replaced, not the one now serving.
+//   - successful hot replacement shuts nothing down. The host quiesces the old
+//     client, inits and registers the new one, and only moves the old client
+//     record to the retired list (host.go:345-356). The plugin sees init(new)
+//     with no shutdown in between, so the generation now serving can never be
+//     retired by the swap itself.
+//   - full unload tears every generation down anyway. UnloadPlugin
+//     (host.go:648-708) and ShutdownAll (host.go:720-800) shut the active
+//     client down first and the retired ones after it; order does not matter
+//     once all of them must die, and FIFO drains the queue either way.
+//   - a failed replacement cleans up the candidate before it rolls back
+//     (host.go:557-600). That candidate's shutdown retires the oldest
+//     generation, the newest handler is still alive, and the old table's
+//     reconfigure reaches it through Current — so the rollback still serves.
+//   - unload + reinstall: shutdown(old) → … → init(new). The old generation is
+//     retired while it is the only one live; the queue is empty again before
+//     init runs, so a shutdown that finds nothing to retire is a no-op. That
+//     no-op is not a general licence for duplicate shutdowns across a new init:
+//     it only means this queue has no unspent generation left.
+//
+// What FIFO guarantees, then, is these three properties: a successful
+// replacement never stops the new instance, a complete unload releases every
+// generation, and a failed rollback leaves the newest generation serving.
+//
+// This depends on the host's lifecycle contract: exactly one shutdown per
+// successfully loaded client, and the close orders above. If a future host
+// changes either — closing a client twice or not at all, closing an old client
+// while it is still in use, or closing clients in an order that assumes each
+// shutdown is paired with a specific generation — this scheme must be
+// re-reviewed before it is relied on. The same applies if the #2 collector
+// needs to be released strictly per real instance rather than per generation.
 type Runtime struct {
 	mu         sync.Mutex
 	generation uint64
 	current    *Handler
 	// live holds the generations init created that no shutdown has retired yet,
-	// oldest first. Each one is retired by exactly one cliproxy_plugin_shutdown.
+	// oldest first. Every cliproxy_plugin_shutdown spends one entry; which
+	// generation it belonged to in the host is not knowable here.
 	live []*Handler
 }
 
@@ -98,10 +128,11 @@ func (r *Runtime) Generation() uint64 {
 	return r.generation
 }
 
-// Shutdown retires the oldest generation that is still live — the one the
-// host's shutdown call belongs to, since the host issues one shutdown per init.
-// Retiring the oldest rather than the newest is what stops a call arriving on a
-// retired function table from stopping the generation that replaced it.
+// Shutdown retires the oldest generation that is still live. The ABI cannot say
+// which generation a shutdown belongs to, so the queue spends one live
+// generation per shutdown it receives (see the package comment). Retiring the
+// oldest rather than the newest is what stops a call arriving on a retired
+// function table from stopping the generation that replaced it.
 //
 // It is a no-op once every generation has been retired, so repeated calls do
 // not change an already-stopped instance.
