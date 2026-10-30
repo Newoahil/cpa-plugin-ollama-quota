@@ -169,23 +169,22 @@ func (p *Provider) setHostBridge(call HostCall) {
 //
 //  1. it cancels the collector's context and waits for the collector goroutine
 //     to exit, so no sweep keeps running after quiesce;
-//  2. it then waits on the bridge's in-flight set, which is what closes the P1-b
-//     gap: a context.AfterFunc cancel callback runs on a runtime goroutine that
-//     the collector goroutine does not wait for, and it can still be inside
-//     host.http.cancel when the collector returns. Waiting on the in-flight set
-//     drains every such call, so by the time stop returns no host call this
-//     plugin started is still running and the library can be unloaded.
+//  2. it then waits on the bridge's in-flight set, which is what closes the
+//     P1-b gap: a context.AfterFunc cancel callback runs on a runtime goroutine
+//     that the collector goroutine does not wait for, and it can still be
+//     inside host.http.cancel when the collector returns.
 //
-// BOTH waits are bounded, and for the same reason (P2-1): a synchronous C
-// callback cannot be abandoned by this plugin. If the collector goroutine is
-// parked inside host.auth.list, it will not notice the cancel until that call
-// returns, and waiting for it unbounded would make quiesce hang on exactly the
-// broken host this is meant to survive. So the collector wait is bounded by the
-// attempt budget plus a small margin, and when it expires the collector is left
-// to unwind on its own; the in-flight bound still applies underneath it.
+// BOTH waits are bounded. A host call is a synchronous C function this plugin
+// cannot abandon, so an unbounded wait would wedge hot replacement on exactly
+// the broken host the bound is meant to survive.
+//
+// The bound expiring is a FAILURE, not a success: the returned drainOutcome
+// says so, and State.Quiesce turns it into a refused quiesce. Reporting
+// success (or only logging) while a host call is still live would tell the
+// host it may unload a library that still has work running in it.
 //
 // It must be called outside the state lock.
-func (p *Provider) startCollector(cfg Config) context.CancelFunc {
+func (p *Provider) startCollector(cfg Config) func() drainOutcome {
 	interval := time.Duration(cfg.IntervalSeconds) * time.Second
 	if interval <= 0 {
 		interval = defaultIntervalSeconds * time.Second
@@ -205,32 +204,44 @@ func (p *Provider) startCollector(cfg Config) context.CancelFunc {
 	// The bridge is read once here rather than inside stop: a register that
 	// replaced it would otherwise leave the old generation's calls unbarriered.
 	bridge := p.bridge()
+	waitBudget := p.attemptTimeout() + collectorBarrierGrace
 
-	// One dead-man timer for the whole stop, so the two waits share a single
-	// budget rather than each getting its own.
-	return func() {
+	return func() drainOutcome {
 		cancel()
 
-		waitBudget := p.attemptTimeout() + collectorBarrierGrace
+		// One deadline for the whole stop, so the two waits share a budget
+		// instead of each getting its own. The collector goroutine gets first
+		// claim on it because the in-flight set can only be read once it has
+		// stopped starting new calls.
+		deadline := time.Now().Add(waitBudget)
+
+		// The waiter exists so the select can see the collector exit. When the
+		// timeout branch fires it is still parked on <-done, and that is
+		// deliberate: it is how the collector's eventual exit is observed
+		// without the stop blocking on it. It is one goroutine per stop, it
+		// ends when the collector finishes, and it does not accumulate per
+		// refresh (SPEC 4.4 is about the collector's own count).
 		stopped := make(chan struct{})
 		go func() {
 			<-done
-			if bridge != nil {
-				barrier, cancelBarrier := context.WithTimeout(context.Background(), waitBudget)
-				bridge.waitInflight(barrier)
-				cancelBarrier()
-			}
 			close(stopped)
 		}()
-
 		select {
 		case <-stopped:
-		case <-time.After(waitBudget):
-			// The collector (or a host call it made) did not return in time. The
-			// goroutine above is left waiting so it can finish the drain if the
-			// host ever answers; it is not detached work, it is the same drain
-			// that would have run a moment later.
+		case <-time.After(time.Until(deadline)):
+			// The collector goroutine is still parked in a host call. Report
+			// that rather than pretending the stop finished; the goroutine is
+			// left to unwind on its own so it cannot leak into the next
+			// generation.
+			return drainOutcome{pending: 1}
 		}
+
+		if bridge == nil {
+			return drainOutcome{drained: true}
+		}
+		barrier, cancelBarrier := context.WithDeadline(context.Background(), deadline)
+		defer cancelBarrier()
+		return bridge.waitInflight(barrier)
 	}
 }
 

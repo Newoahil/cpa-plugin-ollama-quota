@@ -136,7 +136,16 @@ func (c *collector) refreshOne(ctx context.Context, bridge *hostBridge, entry pl
 	}()
 
 	index := authIndexOf(entry)
-	auth, errGet := bridge.getAuth(ctx, index)
+
+	// One deadline for the whole attempt: credential read plus HTTP. It covers
+	// host.auth.get, which runs before any request and therefore used to fall
+	// outside every budget (P2-1): with the collector's bare context,
+	// callBounded took its synchronous path, so a host that never answered
+	// here parked the sweep -- and the stop path -- indefinitely.
+	attempt, cancelAttempt := context.WithTimeout(ctx, c.provider.attemptTimeout())
+	defer cancelAttempt()
+
+	auth, errGet := bridge.getAuth(attempt, index)
 	if errGet != nil {
 		// The bridge's message names the callback and, at most, the credential's
 		// index — never its contents. It is the only way to tell "the host has
@@ -154,7 +163,10 @@ func (c *collector) refreshOne(ctx context.Context, bridge *hostBridge, entry pl
 	}
 	// Collection failures are already recorded in the store as that
 	// credential's stale reason, so the sweep only needs the count.
-	if _, errFetch := c.provider.fetchQuota(ctx, request, ""); errFetch != nil {
+	// The same budget continues into the HTTP leg: fetchQuotaWithinBudget does
+	// not mint a second deadline, so the two halves cannot each claim the full
+	// timeout.
+	if _, errFetch := c.provider.fetchQuotaWithinBudget(attempt, request, ""); errFetch != nil {
 		return false
 	}
 	return true

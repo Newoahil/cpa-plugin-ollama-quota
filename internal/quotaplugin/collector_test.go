@@ -103,9 +103,10 @@ func TestQuiesceStopsTheCollector(t *testing.T) {
 			defer close(done)
 			worker.run(ctx)
 		}()
-		state.SetCollector(func() {
+		state.SetCollector(func() drainOutcome {
 			cancel()
 			<-done
+			return drainOutcome{drained: true}
 		})
 	})
 
@@ -261,9 +262,10 @@ func TestCollectorSurvivesPanicInSweep(t *testing.T) {
 			defer close(done)
 			worker.run(ctx)
 		}()
-		state.SetCollector(func() {
+		state.SetCollector(func() drainOutcome {
 			cancel()
 			<-done
+			return drainOutcome{drained: true}
 		})
 	})
 

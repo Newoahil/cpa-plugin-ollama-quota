@@ -1,7 +1,6 @@
 package quotaplugin
 
 import (
-	"context"
 	"errors"
 	"sync"
 )
@@ -42,6 +41,16 @@ func (p Phase) String() string {
 // not a second chance on this one.
 var ErrStopped = errors.New("plugin instance is stopped")
 
+// ErrQuiesceIncomplete reports a quiesce whose in-flight host calls could not be
+// drained inside the bounded wait.
+//
+// It is a real failure and the host has to see it: reporting success here would
+// tell the host it may swap or unload a library that still has a collection
+// callback running inside it. The bound exists because this plugin cannot
+// abandon a synchronous host call, and waiting forever would wedge hot
+// replacement on exactly the broken host the bound is meant to survive.
+var ErrQuiesceIncomplete = errors.New("quiesce could not drain in-flight collection calls")
+
 // State tracks one loaded plugin instance across the register / quiesce /
 // shutdown cycle the host drives.
 //
@@ -73,7 +82,7 @@ type State struct {
 	phase       Phase
 	provider    *Provider
 	config      Config
-	collectStop context.CancelFunc
+	collectStop func() drainOutcome
 	// collectorStart starts the background collector and installs its stop
 	// function. Register calls it on every transition into active; a nil hook
 	// means this instance runs without a collector (tests that only exercise
@@ -171,49 +180,75 @@ func (s *State) Register(configYAML []byte) (Config, error) {
 	return cfg, errConfig
 }
 
-// Quiesce refuses new work and stops in-flight work. It returns the phase it
-// was in before the call, which tests use to prove idempotence.
+// Quiesce refuses new work, cancels in-flight fetches, and drains the host
+// calls the collector started.
+//
+// A successful quiesce means every host call this plugin started has
+// returned, so the library is safe to unload. That is a BOUNDED guarantee:
+// the drain waits at most the attempt budget plus a small margin, because a
+// host that ignores the cancel cannot be abandoned from inside the plugin.
+// When the bound expires Quiesce reports ErrQuiesceIncomplete and the RPC
+// layer refuses the call, which is what tells the host there is no safe
+// unload condition right now. Reporting success while a callback still runs
+// would be worse than a longer wait: the host would swap a live library.
+//
+// It returns the phase it was in before the call, plus the drain error. A
+// quiesce that finds the instance already quiescing reports the phase only: a
+// second stop has nothing new to drain, and the first call already told the
+// host the truth.
 //
 // The phase change and the provider cancellation happen under one lock. The
 // collector stop is taken under the lock and invoked after it is released.
-func (s *State) Quiesce() Phase {
+func (s *State) Quiesce() (Phase, error) {
 	s.mu.Lock()
 	previous := s.phase
 	if previous == PhaseStopped || previous == PhaseQuiescing {
 		s.mu.Unlock()
-		return previous
+		return previous, nil
 	}
 	s.phase = PhaseQuiescing
 	stop := s.takeCollectorLocked()
 	s.provider.CancelAll()
 	s.mu.Unlock()
 
-	if stop != nil {
-		stop()
+	if stop == nil {
+		return previous, nil
 	}
-	return previous
+	if outcome := stop(); !outcome.drained {
+		return previous, outcome.errDrainTimeout()
+	}
+	return previous, nil
 }
 
-// Shutdown is quiesce plus the terminal phase transition.
-func (s *State) Shutdown() {
+// Shutdown is quiesce plus the terminal phase transition. It reports the same
+// bounded-drain failure Quiesce does; the phase is stopped regardless, so a
+// caller cannot accidentally keep using this instance.
+func (s *State) Shutdown() error {
 	s.mu.Lock()
 	if s.phase == PhaseStopped {
 		s.mu.Unlock()
-		return
+		return nil
 	}
 	s.phase = PhaseStopped
 	stop := s.takeCollectorLocked()
 	s.provider.CancelAll()
 	s.mu.Unlock()
 
-	if stop != nil {
-		stop()
+	if stop == nil {
+		return nil
 	}
+	// Shutdown is terminal either way: the phase stays stopped so nothing
+	// can revive this instance. The error only reports that the drain did
+	// not finish, which the host needs to know before it unloads.
+	if outcome := stop(); !outcome.drained {
+		return outcome.errDrainTimeout()
+	}
+	return nil
 }
 
 // takeCollectorLocked detaches the collector stop function so it is called
 // exactly once. The caller must invoke it after releasing the lock.
-func (s *State) takeCollectorLocked() context.CancelFunc {
+func (s *State) takeCollectorLocked() func() drainOutcome {
 	stop := s.collectStop
 	s.collectStop = nil
 	return stop
@@ -262,7 +297,7 @@ func (s *State) Config() Config {
 // that replaces one owns stopping the old one, which is what Register does
 // before calling this (it must, because stopping under this lock would wait on
 // a goroutine that may be inside the plugin).
-func (s *State) SetCollector(stop context.CancelFunc) {
+func (s *State) SetCollector(stop func() drainOutcome) {
 	if stop == nil {
 		return
 	}

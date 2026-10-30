@@ -3,6 +3,7 @@ package quotaplugin
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -111,14 +112,27 @@ func (s *store) forget(key string) {
 // request — is bounded by one deadline (P2-1). Both host calls it makes
 // (host.auth.get and host.http.do) enforce it themselves, because a deadline set
 // here cannot reach a synchronous C callback (see hostBridge.callBounded).
+// fetchQuota is the entry point that owns its own budget: the whole attempt
+// (credential read plus HTTP) runs under one deadline minted here.
 func (p *Provider) fetchQuota(ctx context.Context, request pluginapi.QuotaFetchRequest, callbackID string) (pluginapi.QuotaFetchResponse, error) {
+	budget, cancelBudget := context.WithTimeout(ctx, p.attemptTimeout())
+	defer cancelBudget()
+	return p.fetchQuotaWithinBudget(budget, request, callbackID)
+}
+
+// fetchQuotaWithinBudget is fetchQuota for a caller that already holds the
+// attempt budget. The collector uses it so the credential read and the
+// HTTP request it feeds share ONE deadline instead of each claiming the
+// full timeout (P2-1). ctx must carry that deadline; if it does not, the
+// call fails rather than silently running unbounded.
+func (p *Provider) fetchQuotaWithinBudget(budget context.Context, request pluginapi.QuotaFetchRequest, callbackID string) (pluginapi.QuotaFetchResponse, error) {
+	if _, ok := budget.Deadline(); !ok {
+		return pluginapi.QuotaFetchResponse{}, fmt.Errorf("%w: the quota fetch needs an attempt deadline", ErrHostUnavailable)
+	}
 	providerKey := ProviderKey(request.Provider)
 	if providerKey != "" && providerKey != QuotaIdentifier {
 		return pluginapi.QuotaFetchResponse{}, UnsupportedProviderError{Provider: providerKey}
 	}
-
-	budget, cancelBudget := context.WithTimeout(ctx, p.attemptTimeout())
-	defer cancelBudget()
 
 	credential, errCredential := p.resolveCredential(budget, request)
 	if errCredential != nil {

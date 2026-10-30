@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"sync/atomic"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -84,6 +85,9 @@ type fixtureHost struct {
 	cancelRelease chan struct{}
 	// authGetBlock, when non-nil, parks host.auth.get until it is closed (P2-1).
 	authGetBlock chan struct{}
+	// authGetHadDeadline records whether the last host.auth.get arrived with a
+	// deadline. P2-1 is exactly the assertion that it does.
+	authGetHadDeadline atomic.Bool
 }
 
 // settingsHTML is a settings page the #2 parser understands: a session window
@@ -106,7 +110,7 @@ func newFixtureHost() *fixtureHost {
 }
 
 // call is the HostCall the plugin under test is built with.
-func (f *fixtureHost) call(_ context.Context, method string, request []byte) ([]byte, error) {
+func (f *fixtureHost) call(ctxOfCall context.Context, method string, request []byte) ([]byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -144,12 +148,10 @@ func (f *fixtureHost) call(_ context.Context, method string, request []byte) ([]
 		if err := json.Unmarshal(request, &req); err != nil {
 			return nil, err
 		}
-		if f.authGetBlock != nil {
-			block := f.authGetBlock
-			f.mu.Unlock()
-			<-block
-			f.mu.Lock()
-			return nil, fmt.Errorf("host.auth.get: released")
+		if ctxOfCall != nil {
+			if _, hasDeadline := ctxOfCall.Deadline(); hasDeadline {
+				f.authGetHadDeadline.Store(true)
+			}
 		}
 		if f.authGetBlock != nil {
 			block := f.authGetBlock

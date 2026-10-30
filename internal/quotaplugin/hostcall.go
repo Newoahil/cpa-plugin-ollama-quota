@@ -113,6 +113,13 @@ func (s *inflightSet) end() {
 	}
 }
 
+// pending reports how many calls are outstanding right now.
+func (s *inflightSet) pending() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.count
+}
+
 // freeze stops counting new calls and returns the channel that is closed once
 // every call already registered has returned.
 func (s *inflightSet) freeze() <-chan struct{} {
@@ -120,6 +127,17 @@ func (s *inflightSet) freeze() <-chan struct{} {
 	defer s.mu.Unlock()
 	s.frozen = true
 	return s.idle
+}
+
+// thaw re-enables counting after a drain attempt gave up. A host that ignores
+// the cancel cannot be abandoned from inside this plugin (the callback is a
+// synchronous C call), so the barrier has to be reusable: a later quiesce
+// must be able to observe the same still-running call and fail again rather
+// than report an empty set it never actually drained.
+func (s *inflightSet) thaw() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.frozen = false
 }
 
 func newHostBridge(call HostCall) *hostBridge {
@@ -203,26 +221,27 @@ func (b *hostBridge) invoke(ctx context.Context, method string, payload any, out
 // waitInflight blocks until every host call this bridge has started has
 // returned, or until ctx expires. It reports whether the bridge drained.
 //
-// This is the barrier the P1-b finding asks for. The collector's stop function
-// waits for the collector goroutine, but a context.AfterFunc cancel callback
-// runs on a runtime goroutine of its own and can still be inside
-// host.http.cancel after the collector has exited. Because every such call is
-// registered by invoke, waiting on this set drains exactly those calls.
+// This is the P1-b barrier. The collector's stop function waits for the
+// collector goroutine, but a context.AfterFunc callback runs on a runtime
+// goroutine of its own and can still be inside host.http.cancel after the
+// collector has exited. Because every such call is registered by invoke,
+// waiting here drains exactly those calls.
 //
-// It adds no goroutine of its own: the wait is a plain select on a channel that
-// the last caller closes, so the collector's goroutine count stays flat
+// It adds no goroutine of its own: the wait is a plain select on a channel
+// that the last caller closes, so the collector's goroutine count stays flat
 // (SPEC 4.4).
 //
 // ctx bounds the wait. A host call that never returns cannot be abandoned by
-// this plugin — the callback is a synchronous C function — so an unbounded wait
-// would make quiesce hang forever on a broken host; the timeout reports that
-// instead, which is the same trade the collection budget makes.
+// this plugin -- the callback is a synchronous C function -- so an unbounded
+// wait would make quiesce hang forever on a broken host. Returning false is
+// therefore a real answer, not a formality: the caller must surface it
+// instead of reporting a successful shutdown (see drainOutcome).
 //
-// Once the barrier has been taken the set is frozen, so a call that starts
-// afterwards is not counted and cannot keep quiesce open indefinitely.
-func (b *hostBridge) waitInflight(ctx context.Context) bool {
+// A failed wait thaws the set, so a later quiesce can observe the same
+// still-running call and fail again rather than seeing a set it never drained.
+func (b *hostBridge) waitInflight(ctx context.Context) drainOutcome {
 	if b == nil {
-		return true
+		return drainOutcome{drained: true}
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -230,10 +249,36 @@ func (b *hostBridge) waitInflight(ctx context.Context) bool {
 	idle := b.inflight.freeze()
 	select {
 	case <-idle:
-		return true
+		return drainOutcome{drained: true}
 	case <-ctx.Done():
-		return false
+		pending := b.inflight.pending()
+		b.inflight.thaw()
+		return drainOutcome{pending: pending}
 	}
+}
+
+// drainOutcome is what a collector stop reports about the host calls it could
+// not finish draining.
+//
+// The plugin cannot wait forever (a host that ignores the cancel would wedge
+// hot replacement), so a bounded wait is the right shape. What is NOT
+// acceptable is reporting success when the bound expired: the host would go on
+// to swap or unload a library with a live call in it. This type is how that
+// turns into an observable failure at the RPC boundary instead of a log line.
+type drainOutcome struct {
+	// drained is true when every host call the plugin started has returned.
+	drained bool
+	// pending is the number of calls still running when the budget expired.
+	pending int
+}
+
+// errDrainTimeout reports a collection that could not be drained.
+//
+// The message is a constant plus a count: the calls still running are host
+// callbacks holding a credential, and none of that may reach a log or a
+// response (SPEC 4.2).
+func (o drainOutcome) errDrainTimeout() error {
+	return fmt.Errorf("%w: %d collection host call(s) still running", ErrQuiesceIncomplete, o.pending)
 }
 
 // callBounded performs one host callback under a deadline the plugin enforces

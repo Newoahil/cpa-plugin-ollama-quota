@@ -117,7 +117,7 @@ func TestQuiesceStopsRegisteredCollector(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 	stopped := false
-	h.state.SetCollector(func() { stopped = true })
+	h.state.SetCollector(func() drainOutcome { stopped = true; return drainOutcome{drained: true} })
 	if _, err := h.Handle(pluginabi.MethodPluginQuiesce, nil); err != nil {
 		t.Fatalf("quiesce: %v", err)
 	}

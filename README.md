@@ -135,6 +135,19 @@ scripts/build.sh --go               # 用本机的 Go 和 C 工具链编译当�
    进程不重启；之后的额度页里不再有 Ollama 行。**注意这条命令会把 `plugins.configs.ollama-quota`
    从 `config.yaml` 里删掉**，想重新装回来要再把上面那段加回去。
 
+> **`quiesce` 的排空是「有界保证」**：插件会等在途的采集宿主调用返回，上限是一次采集预算
+> （默认 20 秒，见 `ollama.DefaultTimeout`）加 2 秒余量。
+> - 上限内排空完成 → `plugin.quiesce` 返回成功，库可以安全卸载。
+> - 超过上限（宿主没响应取消）→ 返回错误 `quiesce_incomplete`，**不是成功**：此时卸载会把
+>   仍有回调在跑的库换掉。
+>
+> 为什么要设上限而不是一直等：宿主回调是同步 C 调用，插件无法中断它；无限等会让一次卡死的
+> 采集永久堵住热替换。
+>
+> **宿主侧目前并不因为这个错误而阻止替换**（`internal/pluginhost/host.go:291` 只记日志就继续
+> `startPluginLoad`），所以这条保证要靠宿主改动才能变成硬约束——需另立 CPA 票。插件这一侧
+> 能做的已经做了：错误可观察、可重试、可作判据。
+
 > 当前版本 0.1.2 已接真实采集：凭证里的 `api_key` 走 `GET https://ollama.com/api/balance`，
 > 只有 `cookie` 时走 `GET https://ollama.com/settings` 解析 HTML；两条都失败时返回上一次成功读到的
 > 数字并标「已过期」，从没成功过则返回错误、不带数字。插件按 `interval_seconds`（默认 900 秒）

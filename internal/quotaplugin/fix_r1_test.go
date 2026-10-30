@@ -215,9 +215,10 @@ func TestBlockedAuthListEndsTheSweep(t *testing.T) {
 			defer close(done)
 			worker.run(ctx)
 		}()
-		state.SetCollector(func() {
+		state.SetCollector(func() drainOutcome {
 			cancel()
 			<-done
+			return drainOutcome{drained: true}
 		})
 	})
 	if _, err := state.Register([]byte("interval_seconds: 30\n")); err != nil {

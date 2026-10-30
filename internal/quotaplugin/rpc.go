@@ -111,10 +111,18 @@ func (h *Handler) Handle(method string, request []byte) ([]byte, error) {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
 		return h.handleRegister(request)
 	case pluginabi.MethodPluginQuiesce:
-		h.state.Quiesce()
+		// A quiesce that could not drain reports a failure. The host reads
+		// this before it swaps or unloads: an OK envelope would tell it the
+		// library has no live call in it, which is exactly what the drain
+		// budget just disproved.
+		if _, errQuiesce := h.state.Quiesce(); errQuiesce != nil {
+			return ErrorEnvelope("quiesce_incomplete", errQuiesce.Error()), nil
+		}
 		return OKEnvelope(struct{}{})
 	case pluginabi.MethodPluginShutdown:
-		h.state.Shutdown()
+		if errShutdown := h.state.Shutdown(); errShutdown != nil {
+			return ErrorEnvelope("shutdown_incomplete", errShutdown.Error()), nil
+		}
 		return OKEnvelope(struct{}{})
 	case pluginabi.MethodQuotaIdentifier:
 		return OKEnvelope(IdentifierResponse{Identifier: QuotaIdentifier})
