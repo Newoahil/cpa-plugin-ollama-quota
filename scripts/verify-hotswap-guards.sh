@@ -61,6 +61,7 @@ docker() {
     image)     return 0 ;;                                  # image already present
     pull)      return 0 ;;
     ps)
+      [[ "${STUB_PS_FAILS:-0}" == "1" ]] && { echo "stub: docker ps failed" >&2; return 1; }
       if [[ "${STUB_RUNNING:-0}" == "1" ]]; then
         printf '%s\n' "${STUB_RUNNING_ID:-deadbeefcafe}"
       fi
@@ -73,6 +74,7 @@ docker() {
         prev="$arg"
       done
       if [[ "$format" == *Mounts* ]]; then
+        [[ "${STUB_INSPECT_FAILS:-0}" == "1" ]] && { echo "stub: docker inspect failed" >&2; return 1; }
         printf '%s|%s|\n' "${STUB_MOUNT_NAME:-/existing-cpa}" "${STUB_MOUNT_SOURCE:-}"
         return 0
       fi
@@ -116,15 +118,16 @@ run_case() {
           [[ "${STUB_PORT_BUSY:-0}" == "1" ]] && return 0
           return 1 ;;
         *mount_overlap.py)
-          printf 'python %s\n' "$*" >> "$DOCKER_CALL_LOG"
-          if [[ "${STUB_MOUNT_OVERLAP:-0}" == "1" ]]; then
-            # Consume stdin the way the real helper does, then report a hit.
-            cat >/dev/null
-            echo "existing-cpa mount source /tmp overlaps $2"
-            return 0
-          fi
+          printf 'python %s
+' "$*" >> "$DOCKER_CALL_LOG"
           cat >/dev/null
-          return 1 ;;
+          # Helper exit codes are the contract: 0 overlap, 1 no overlap,
+          # anything else is a failure the caller must refuse on.
+          case "${STUB_MOUNT_OVERLAP:-0}" in
+            1) echo "existing-cpa mount source /tmp overlaps $2"; return 0 ;;
+            3) echo "stub: helper crashed" >&2; return 3 ;;
+            *) return 1 ;;
+          esac ;;
         *)
           command python "$@" ;;
       esac
@@ -231,6 +234,65 @@ if [[ "$(rm_calls "$SCRATCH/cleanup.calls")" == "0" ]]; then
 else
   bad "R1 ownership: cleanup removed something with no owned IDs: $(grep '^docker rm ' "$SCRATCH/cleanup.calls" | tr '\n' ' ')"
 fi
+
+# ------------------------------------------- R5-2: a failed check must refuse
+# "The check could not run" and "the check found no overlap" are different
+# facts. Each of these makes the mount check fail in a different way; every one
+# must refuse, and none may reach `docker run` or emit `docker rm`.
+mount_failure_case() { # mount_failure_case <tag> <extra-env> <expected-wording>
+  local tag="$1" extra="$2" wording="$3"
+  run_case "$tag" "STUB_RUNNING=1" "$extra" --
+  local rc; rc="$(cat "$SCRATCH/$tag.rc")"
+  [[ "$rc" == "1" ]] && ok "R5-2 $tag: exits 1" || bad "R5-2 $tag: exit $rc, want 1 (see $SCRATCH/$tag.out)"
+  if grep -q "$wording" "$SCRATCH/$tag.out"; then
+    ok "R5-2 $tag: says which check failed"
+  else
+    bad "R5-2 $tag: diagnostic missing (wanted '$wording')"
+  fi
+  if grep -q '^docker run ' "$SCRATCH/$tag.calls"; then
+    bad "R5-2 $tag: started a container despite the failed check"
+  else
+    ok "R5-2 $tag: 0 docker run"
+  fi
+  [[ "$(rm_calls "$SCRATCH/$tag.calls")" == "0" ]] \
+    && ok "R5-2 $tag: 0 docker rm" \
+    || bad "R5-2 $tag: removed something: $(grep '^docker rm ' "$SCRATCH/$tag.calls" | tr '\n' ' ')"
+}
+
+echo "--- R5-2: any failed check refuses instead of passing"
+mount_failure_case inspectfail "STUB_INSPECT_FAILS=1" "docker inspect failed"
+mount_failure_case psfail      "STUB_PS_FAILS=1"      "docker ps -q failed"
+mount_failure_case helpercrash "STUB_MOUNT_OVERLAP=3" "overlap helper exited 3"
+
+# ------------------------------------ R5-1: the real helper, six path shapes
+# These call scripts/mount_overlap.py directly. No stub is involved: this is the
+# check the reviewer used to find the root-directory and Windows-case misses, so
+# it has to be the real helper that passes it.
+helper_case() { # helper_case <label> <candidate> <mount-source> <expected-exit>
+  local label="$1" candidate="$2" source="$3" expected="$4" actual
+  # MSYS_NO_PATHCONV stops Git Bash rewriting /safe/test into a drive path
+  # before the helper ever sees it.
+  actual="$(
+    printf '/existing-cpa|%s|\n' "$source" \
+      | MSYS_NO_PATHCONV=1 "$REAL_PYTHON" scripts/mount_overlap.py "$candidate" >/dev/null 2>&1
+    echo $?
+  )"
+  if [[ "$actual" == "$expected" ]]; then
+    ok "R5-1 real helper: $label (exit $actual)"
+  else
+    bad "R5-1 real helper: $label — exit $actual, want $expected (candidate '$candidate', mount '$source')"
+  fi
+}
+
+echo "--- R5-1: the real helper on six path shapes"
+if command -v python >/dev/null 2>&1; then REAL_PYTHON=python; else REAL_PYTHON=python3; fi
+helper_case "equal"                    "/safe/test"      "/safe/test" 0
+helper_case "candidate is ancestor"    "/safe"           "/safe/test" 0
+helper_case "candidate is descendant"  "/safe/test"      "/safe"      0
+helper_case "filesystem root"          "/safe/test"      "/"          0
+helper_case "Windows differs in case"  "C:/Temp/Test"    "c:/temp"    0
+helper_case "unrelated"                "/safe/test"      "/other"     1
+
 
 # ------------------------------------------------------ R3: tree never stamped
 # The two real builds are expensive and need Go, so this checks the cheaper

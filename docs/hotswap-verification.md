@@ -37,7 +37,8 @@ CPA 进程 PID、容器 `StartedAt`、`RestartCount` 三项全程不变，替换
 
 - 端口 `18999` 或 `18080` 已被监听
 - 容器名 `ollama-hotswap-test` / `ollama-hotswap-upstream` 已存在
-- 运行中的容器把某个目录挂进了临时目录（相等 / 祖先 / 后代都算）
+- 运行中的容器把某个目录挂进了临时目录（相等 / 祖先 / 后代 / 根目录都算；Windows 路径按大小写不敏感）
+- 上面这项检查本身跑不起来（`docker ps` / `docker inspect` 失败、helper 崩溃）——检查失败也算拒绝
 - 临时目录不是全新建的
 
 拒绝时退出码为 1，**不启动任何容器，也不执行任何 `docker rm`**（包括不会删掉那个
@@ -74,8 +75,9 @@ CPA 进程 PID、容器 `StartedAt`、`RestartCount` 三项全程不变，替换
     container name ollama-hotswap-test is unused
     container name ollama-hotswap-upstream is unused
     plugin versions: v0.1.2 (committed) -> v0.1.3 (second build)
-    temp dir /tmp/ollama-hotswap.73jTbE is new
-    no running container mounts a tree containing /tmp/ollama-hotswap.73jTbE
+    temp dir /tmp/ollama-hotswap.6rOIxY is new
+    checking 3 running container(s) for mount overlap
+    no running container mounts a tree containing /tmp/ollama-hotswap.6rOIxY
     images present: eceasy/cli-proxy-api:v8.0.47, golang:1.26-bookworm
 
 === building the fixtures (fake upstream + plugin v0.1.2 and v0.1.3)
@@ -86,11 +88,11 @@ go: downloading github.com/router-for-me/CLIProxyAPI/v8 v8.0.47
     the working tree's plugin.go was never modified (still v0.1.2)
 
 === starting the fake upstream on 127.0.0.1:18080
-    upstream container b0fe1f7e9a1de1074a76e8aac42ad17fc6a619030d6f1bca6ce584a39e8b9050
+    upstream container 78575846a08cd528a1b1f0be6645c4108026d19488cad8ba7d8117e763d6ac27
     upstream healthy
 
 === starting the isolated CPA instance on 127.0.0.1:18999
-    CPA container 7b594faeb550aeaca6f70c9292bd11b051429d339dcb517020b31103d7326685
+    CPA container 76bc8d866205d7a17fb26f0d66a096e543fa7fc75299288faff486eca3d49461
     CPA answered
 
 === enabling plugin v0.1.2
@@ -99,7 +101,7 @@ go: downloading github.com/router-for-me/CLIProxyAPI/v8 v8.0.47
 
 === starting a 40s streaming request
     request is streaming (1 tokens so far)
-    PID during the request: 3374416 (before: 3374416)
+    PID during the request: 3448982 (before: 3448982)
 
 === swapping the plugin file to v0.1.3 while the request is open
     host reports v0.1.3
@@ -108,15 +110,15 @@ go: downloading github.com/router-for-me/CLIProxyAPI/v8 v8.0.47
 === assertions
 
 request timeline (UTC)
-  started         2026-10-30T10:57:49Z
-  swap confirmed  +9s
-  ended           2026-10-30T10:58:29Z
+  started         2026-10-30T11:13:42Z
+  swap confirmed  +10s
+  ended           2026-10-30T11:14:22Z
   measured        40s (the acceptance gate needs >30s)
   response        8207 bytes, 40/40 distinct tokens
 
 CPA process
-  PID           before=3374416  mid=3374416  after=3374416
-  StartedAt     before=2026-10-30T10:57:47.564568544Z  after=2026-10-30T10:57:47.564568544Z
+  PID           before=3448982  mid=3448982  after=3448982
+  StartedAt     before=2026-10-30T11:13:41.131558951Z  after=2026-10-30T11:13:41.131558951Z
   RestartCount  before=0  after=0
 
 results
@@ -126,9 +128,9 @@ results
   PASS  the upstream finished normally — finish_reason=stop
   PASS  the final usage chunk arrived — completion_tokens present
   PASS  every token arrived — 40/40
-  PASS  the request spanned the swap — started 2026-10-30T10:57:49Z, swap at +9s, ended 2026-10-30T10:58:29Z
+  PASS  the request spanned the swap — started 2026-10-30T11:13:42Z, swap at +10s, ended 2026-10-30T11:14:22Z
   PASS  the request outlived 30 seconds — measured 40s
-  PASS  the CPA process kept its PID — 3374416 throughout
+  PASS  the CPA process kept its PID — 3448982 throughout
   PASS  the container was not restarted — StartedAt unchanged
   PASS  no restart was counted — RestartCount 0
   PASS  the new plugin version is live — v0.1.3
@@ -137,13 +139,13 @@ results
   PASS  CPA logged no errors — 0 error/fatal lines
   PASS  CPA did not panic — clean
 
-PASS  hot swap verified: a 40s request (measured) crossed the swap intact, the CPA process kept PID 3374416, and v0.1.3 is live
+PASS  hot swap verified: a 40s request (measured) crossed the swap intact, the CPA process kept PID 3448982, and v0.1.3 is live
 
 === cleanup
-    removed the CPA container this run started (7b594faeb550aeaca6f70c9292bd11b051429d339dcb517020b31103d7326685)
-    removed the upstream container this run started (b0fe1f7e9a1de1074a76e8aac42ad17fc6a619030d6f1bca6ce584a39e8b9050)
-    removed build scratch /tmp/hotswap-src.kdKPNl
-    removed /tmp/ollama-hotswap.73jTbE
+    removed the CPA container this run started (76bc8d866205d7a17fb26f0d66a096e543fa7fc75299288faff486eca3d49461)
+    removed the upstream container this run started (78575846a08cd528a1b1f0be6645c4108026d19488cad8ba7d8117e763d6ac27)
+    removed build scratch /tmp/hotswap-src.uBXjSH
+    removed /tmp/ollama-hotswap.6rOIxY
 ```
 
 ## 断言逐条说明
@@ -287,14 +289,22 @@ SPEC 4.1 要求：收到 quiesce 后**拒绝新请求、等手上的采集中止
 | 拒绝路径不删任何容器 | 所有前置检查都在第一个 `docker run` 之前；`OWNED_CPA_ID` / `OWNED_UPSTREAM_ID` 只在真正启动后才有值，清理只按这两个 **ID** | 同名容器、端口被占、挂载重合三种拒绝，都是退出 1 且 `docker rm` 调用数 **0** |
 | 清理只删自己创建的 | `docker run -d` 的输出存成容器 ID，`cleanup` 只 `docker rm -f <ID>`，从不按名字 | 直接跑抽出来的 `cleanup`：给出两个 ID 时正好删这两个；不给 ID 时 `docker rm` 调用数 0 |
 | 构建不改工作区源码 | 构建在 `mktemp -d` 的**副本**里做（`stage_build_tree`），`plugin.go` 在副本里盖章 | 脚本内有构建后断言；替身验证还核对 `plugin.go` 与提交版本逐字节相同 |
-| 挂载不重合 | 前置检查读所有运行中容器的 `Mounts[].Source`，与临时目录比相等/祖先/后代 | 替身返回一个挂载父目录的容器 → 退出 1、`docker rm` 0 次、**没有启动任何容器** |
+| 挂载不重合 | 前置检查读所有运行中容器的 `Mounts[].Source`，与临时目录比相等/祖先/后代；根目录 `/` 是任何绝对路径的祖先，Windows 盘符路径按大小写不敏感比较 | 替身返回一个挂载父目录的容器 → 退出 1、`docker rm` 0 次、**没有启动任何容器**；另**直接调用真实 helper** 验六种路径形状（相等 / candidate 祖先 / candidate 后代 / 根 / Windows 不同大小写 / 无关） |
+| 挂载检查失败必须拒绝 | 只接受 helper 退出码 1（明确「无重合」）才继续；0 = 有重合，其它 = 失败，`docker ps` / `docker inspect` 失败也拒绝 | 替身让 `inspect` 失败、`ps` 失败、helper 崩溃三种情况各自退出 1 并打印诊断，**0 次 `docker run`、0 次 `docker rm`** |
 | 短流不给验收结论 | `HOTSWAP_STREAM_SECONDS < 31` 直接拒绝（除非 `--debug`）；结尾用**实测**耗时断言 > 30 秒 | 6 秒流 → 退出 1，输出里没有任何 `PASS  hot swap verified` 行 |
 
 复跑替身验证：
 
 ```sh
-scripts/verify-hotswap-guards.sh      # 18 项全 PASS 才退出 0，全程不碰真实 Docker
+scripts/verify-hotswap-guards.sh      # 36 项全 PASS 才退出 0，全程不碰真实 Docker
 ```
+
+其中路径判定那一组是**直接调用真实 `scripts/mount_overlap.py`**（六种路径形状），
+不是替身——替身只能证明「收到重合结果会拒绝」，证明不了「重合都发现得了」。
+
+`mount_overlap.py` 的退出码本身就是契约：`0` = 有重合，`1` = 明确无重合，
+`2` = 用法错误，`3` = 内部错误。脚本只把 `1` 当作可以继续，其余一律诊断并拒绝，
+所以检查自身坏掉不会被误读成「安全」。
 
 **说明「拒绝即无影响」的证据边界**：替身证明的是**脚本调用了什么 Docker 命令**——
 拒绝路径上没有任何 `rm`，因此不可能删掉别人的容器。它不能证明真实 Docker 的其它

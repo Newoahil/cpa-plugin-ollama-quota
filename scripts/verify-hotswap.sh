@@ -229,29 +229,81 @@ note "temp dir $WORKDIR is new"
 # visible to that CPA. Compare against every running container's mount sources
 # and refuse on any equality, ancestor, or descendant overlap. This is read-only:
 # it inspects, and never touches those containers.
-if docker ps -q 2>/dev/null | grep -q .; then
-  mapfile -t running_ids < <(docker ps -q)
-  inspect_fmt='{{.Name}}|{{range .Mounts}}{{.Source}}|{{end}}'
-  mount_overlap="$(
-    docker inspect --format "$inspect_fmt" "${running_ids[@]}" 2>/dev/null \
-      | "$PYTHON" scripts/mount_overlap.py "$WORKDIR" "$(host_path "$WORKDIR")" || true
-  )"
-  if [[ -n "$mount_overlap" ]]; then
-    {
-      printf '\nFAIL: the temp tree overlaps an existing container'"'"'s bind mount.\n'
-      printf '    Refusing to start: a running container can already see inside\n'
-      printf '    %s, so this test instance would not be isolated.\n' "$WORKDIR"
-      printf '    Overlapping mount(s):\n'
-      printf '%s\n' "$mount_overlap" | sed 's/^/      /'
-      printf '    Choose a different location (for example a TMPDIR outside any\n'
-      printf '    mounted tree). Nothing was started and nothing was removed.\n'
-    } >&2
-    exit 1
+#
+# The check must distinguish three outcomes, and only one of them may continue:
+#   * helper exit 1  -> the check ran and found no overlap         -> continue
+#   * helper exit 0  -> overlap found (its lines name the mounts)  -> refuse
+#   * anything else  -> ps/inspect failed, helper crashed, timeout -> refuse
+# Swallowing a failure here would turn a broken safety check into a silent pass,
+# which is exactly the isolation hole this preflight exists to close.
+mount_check_failure() { # mount_check_failure <what went wrong>
+  {
+    printf '\nFAIL: the mount-overlap check could not be completed.\n'
+    printf '    %s\n' "$1"
+    printf '    Refusing to start: "no running container can see %s"\n' "$WORKDIR"
+    printf '    was NOT proven, so this run cannot claim to be isolated.\n'
+    printf '    Nothing was started and nothing was removed.\n'
+  } >&2
+  exit 1
+}
+
+mount_overlap_scan() {
+  local ps_out inspect_out helper_out helper_rc
+  local -a running_ids
+
+  # `docker ps -q` failing must not read as "no containers are running".
+  if ! ps_out="$(docker ps -q 2>"$WORKDIR/docker-ps.err")"; then
+    mount_check_failure "docker ps -q failed: $(head -3 "$WORKDIR/docker-ps.err" 2>/dev/null | tr '\n' ' ')"
   fi
-  note "no running container mounts a tree containing $WORKDIR"
-else
-  note "no running containers; mount overlap cannot apply"
-fi
+  mapfile -t running_ids <<<"$ps_out"
+  # Drop the empty element mapfile produces for an empty stream.
+  running_ids=("${running_ids[@]/#/}")
+  local kept=()
+  for id in "${running_ids[@]}"; do [[ -n "$id" ]] && kept+=("$id"); done
+  running_ids=("${kept[@]}")
+
+  if [[ ${#running_ids[@]} -eq 0 ]]; then
+    note "no running containers; the mount-overlap check does not apply"
+    return 0
+  fi
+  note "checking ${#running_ids[@]} running container(s) for mount overlap"
+
+  if ! inspect_out="$(docker inspect --format '{{.Name}}|{{range .Mounts}}{{.Source}}|{{end}}' \
+        "${running_ids[@]}" 2>"$WORKDIR/docker-inspect.err")"; then
+    mount_check_failure "docker inspect failed: $(head -3 "$WORKDIR/docker-inspect.err" 2>/dev/null | tr '\n' ' ')"
+  fi
+
+  # The helper runs to completion so its exit code is meaningful; `|| true` here
+  # would erase exactly the signal being tested.
+  set +e
+  helper_out="$(printf '%s\n' "$inspect_out" | "$PYTHON" scripts/mount_overlap.py "$WORKDIR" "$(host_path "$WORKDIR")" 2>"$WORKDIR/mount-overlap.err")"
+  helper_rc=$?
+  set -e
+
+  case "$helper_rc" in
+    0)
+      {
+        printf '\nFAIL: the temp tree overlaps an existing container'"'"'s bind mount.\n'
+        printf '    Refusing to start: a running container can already see inside\n'
+        printf '    %s, so this test instance would not be isolated.\n' "$WORKDIR"
+        printf '    Overlapping mount(s):\n'
+        printf '%s\n' "$helper_out" | sed 's/^/      /'
+        printf '    Choose a different location (for example a TMPDIR outside any\n'
+        printf '    mounted tree). Nothing was started and nothing was removed.\n'
+      } >&2
+      exit 1
+      ;;
+    1)
+      note "no running container mounts a tree containing $WORKDIR"
+      return 0
+      ;;
+    *)
+      mount_check_failure "the overlap helper exited $helper_rc: $(head -3 "$WORKDIR/mount-overlap.err" 2>/dev/null | tr '\n' ' ')"
+      ;;
+  esac
+}
+
+mount_overlap_scan
 
 mkdir -p "$WORKDIR/plugins" "$WORKDIR/auths" "$WORKDIR/build"
 
