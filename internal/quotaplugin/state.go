@@ -89,21 +89,89 @@ type State struct {
 	// a drain that ended with work still running leaves it in place so the next
 	// Quiesce/Shutdown can re-judge the same in-flight calls instead of
 	// concluding "no stop function, therefore nothing running".
-	collectStop func() drainOutcome
+	collectStop *drainEntry
 	// drainAttempts counts bounded drain judgements, so a caller (and a test)
 	// can tell a real re-check apart from an early return.
 	drainAttempts uint64
-	// orphanDrains holds stops whose drain did not finish and which no longer
-	// own the live collector: a reconfigure replaced them, or they were
-	// installed after a quiesce had already begun. A callback they left
-	// running is still running, so every later drain re-judges them instead
-	// of reporting an empty in-flight set from the new collector alone.
-	orphanDrains []func() drainOutcome
+	// orphanDrains holds every collector this instance detached from the live
+	// slot, or refused one, whose stop has not been confirmed drained.
+	//
+	// An entry is published HERE, under the lock, at the moment its collector
+	// stops being live -- before its stop runs. A concurrent drain therefore
+	// finds the work from the instant it belongs to this instance, instead of
+	// only after the stop happened to fail; while the stop is still executing
+	// the entry answers "not known yet" and the drain fails rather than
+	// reporting an empty in-flight set over a callback that is already inside
+	// the host.
+	//
+	// Entries leave the list when a drain confirms them drained, so the list
+	// tracks outstanding work, not the instance's history: a reconfigure loop
+	// cannot make it grow without bound.
+	orphanDrains []*drainEntry
 	// collectorStart starts the background collector and installs its stop
 	// function. Register calls it on every transition into active; a nil hook
 	// means this instance runs without a collector (tests that only exercise
 	// the lifecycle).
 	collectorStart func(Config)
+}
+
+// drainEntry is one collector stop this instance owes a bounded judgement for.
+//
+// A stop function cannot be compared in Go, so the entry is the identity a
+// drain reclaims by; it is also where "is this stop executing right now?" is
+// recorded, which is what keeps a concurrent drain from reporting a collector
+// drained while its stop is mid-flight and its result unknown.
+type drainEntry struct {
+	stop func() drainOutcome
+
+	mu sync.Mutex
+	// running is true while a caller is inside stop. At most one caller runs it
+	// at a time: the stop itself already waits on the host for its own budget,
+	// and a second waiter would burn the same budget learning nothing new.
+	running bool
+}
+
+func newDrainEntry(stop func() drainOutcome) *drainEntry {
+	return &drainEntry{stop: stop}
+}
+
+// judge performs one bounded drain judgement for this entry.
+//
+// Two answers are possible on top of the stop's own:
+//
+//   - drained / not drained: the stop ran and decided. A drained answer lets
+//     the caller reclaim the entry; an undrained one keeps it, and the next
+//     drain runs the stop again -- a retry has to re-judge, never answer from
+//     the earlier attempt.
+//   - unsettled: the stop is executing right now, so its result is not known.
+//     This call reports that as a failure instead of waiting (the concurrent
+//     caller is already waiting, inside its own budget) and instead of
+//     inferring success from work it never saw finish.
+//
+// A drained answer is deliberately NOT remembered: every lifecycle call has to
+// look at the in-flight set itself. What keeps that from costing anything over
+// time is reclamation in State.reclaim, not a cache -- a cached answer would
+// turn "re-judge the drain" back into "answer from earlier state".
+func (e *drainEntry) judge() drainOutcome {
+	e.mu.Lock()
+	if e.running {
+		e.mu.Unlock()
+		return drainOutcome{unsettled: true}
+	}
+	e.running = true
+	e.mu.Unlock()
+
+	// A stop that panics must not leave this entry marked as running forever:
+	// every later judgement would answer "unsettled" and the instance would
+	// never be able to report a drained collector again. The panic itself still
+	// propagates -- the drain callers are the ones that decide what to do with
+	// it, and swallowing it here would be a different, silent failure.
+	defer func() {
+		e.mu.Lock()
+		e.running = false
+		e.mu.Unlock()
+	}()
+	return e.stop()
 }
 
 // NewState returns a state ready for its first register call.
@@ -173,7 +241,11 @@ func (s *State) Register(configYAML []byte) (Config, error) {
 		s.mu.Unlock()
 		return cfg, ErrStopped
 	}
-	stopPrevious := s.takeCollectorLocked()
+	previous := s.detachLiveCollectorLocked()
+	// The old collector is published as pending work in the same critical
+	// section that removes it from the live slot, so there is no moment in which
+	// it is neither: either the lock still shows it live, or it is already
+	// visible to a drain that is about to report on this instance.
 	s.phase = PhaseActive
 	s.config = cfg
 	s.provider.Reset()
@@ -184,16 +256,14 @@ func (s *State) Register(configYAML []byte) (Config, error) {
 	// context and waits for a goroutine that may be mid-request. It must run
 	// outside the lock, exactly like the one quiesce calls.
 	//
-	// If it could not finish, the callback it left behind is still running and
-	// the new collector knows nothing about it. Retaining the stop keeps that
-	// work visible to later drains instead of letting a fresh, empty in-flight
-	// set report success.
-	if stopPrevious != nil {
-		if outcome := stopPrevious(); !outcome.drained {
-			s.mu.Lock()
-			s.retainUndrainedLocked(stopPrevious, false)
-			s.mu.Unlock()
-		}
+	// A failed stop is not recorded here: the entry was already published as
+	// pending work when it was detached, and every later drain re-judges it
+	// until it confirms. Recording only on failure is what left the window in
+	// which a concurrent drain saw an empty set while the stop was still
+	// running. A stop that drains is reclaimed on the spot, so a reconfigure
+	// loop does not accumulate entries.
+	if previous != nil {
+		_ = s.drainEntries([]*drainEntry{previous})
 	}
 	if start != nil {
 		// start installs its own stop function through SetCollector, which stops
@@ -240,7 +310,7 @@ func (s *State) Quiesce() (Phase, error) {
 	s.provider.CancelAll()
 	// The stop function is deliberately NOT taken here: it is retained so a
 	// retry can re-judge.
-	stop := s.collectStop
+	live, pending := s.drainPlanLocked()
 	s.mu.Unlock()
 
 	// Phase is NEVER the answer: neither PhaseQuiescing nor PhaseStopped says
@@ -249,7 +319,7 @@ func (s *State) Quiesce() (Phase, error) {
 	// on it here would report a library that is safe to unload while a callback
 	// is still inside the host -- the cross-entry version of the false success
 	// the reviews kept finding. Every call runs the bounded drain judgement.
-	return previous, s.drain(stop)
+	return previous, s.drain(live, pending)
 }
 
 // Shutdown is quiesce plus the terminal phase transition. It reports the same
@@ -264,7 +334,7 @@ func (s *State) Shutdown() error {
 	s.mu.Lock()
 	s.phase = PhaseStopped
 	s.provider.CancelAll()
-	stop := s.collectStop
+	live, pending := s.drainPlanLocked()
 	s.mu.Unlock()
 
 	// Shutdown is terminal either way: the phase stays stopped so nothing can
@@ -275,73 +345,149 @@ func (s *State) Shutdown() error {
 	// only says new work is refused; a previous shutdown can have given up with
 	// a host call still running, and that call does not disappear because the
 	// phase changed.
-	return s.drain(stop)
+	return s.drain(live, pending)
 }
 
-// takeCollectorLocked detaches the collector stop function. ONLY Register uses
-// it, because a reconfigure genuinely replaces the collector and the old one
-// must not be drained twice.
+// drainPlanLocked returns the work one lifecycle call has to judge: the live
+// collector plus every detached one still pending, each exactly once.
 //
-// Quiesce and Shutdown must NOT use it: consuming the stop function there is
-// what made a failed drain unrecoverable. Once it was nil, a retry saw "no
-// stop function" and reported success while the callback was still running.
-func (s *State) takeCollectorLocked() func() drainOutcome {
-	stop := s.collectStop
+// The live collector is included here rather than read separately by the
+// caller, so a collector that a concurrent Register detaches between this call
+// and the drain cannot be judged twice or -- worse -- missed.
+func (s *State) drainPlanLocked() (live *drainEntry, pending []*drainEntry) {
+	live = s.collectStop
+	for _, entry := range s.orphanDrains {
+		if entry != live {
+			pending = append(pending, entry)
+		}
+	}
+	return live, pending
+}
+
+// detachLiveCollectorLocked removes the live collector from the slot AND
+// publishes it as pending work, in one critical section.
+//
+// ONLY Register uses it, because a reconfigure genuinely replaces the collector
+// and the old one must not be drained twice. Quiesce and Shutdown must NOT use
+// it: consuming the stop function there is what made a failed drain
+// unrecoverable -- with the live slot empty, a retry saw "no stop function" and
+// reported success while the callback was still running.
+//
+// Publication happens here rather than after the stop runs. A stop is code this
+// package does not own and it takes as long as its budget; during that time its
+// collector is neither in the live slot nor, under the old code, in any list a
+// drain looked at. A concurrent quiesce then judged an empty instance while the
+// host callback was already running. Publishing under the same lock that
+// detaches closes that window: from this point the entry is visible, and while
+// its stop is executing it answers "not known yet" instead of "drained".
+func (s *State) detachLiveCollectorLocked() *drainEntry {
+	entry := s.collectStop
 	s.collectStop = nil
-	return stop
+	if entry != nil {
+		s.publishPendingLocked(entry)
+	}
+	return entry
 }
 
-// drain performs one bounded drain judgement and counts it.
-//
-// It is the single place both Quiesce and Shutdown go through, so a repeat
-// call cannot answer from an inference (phase, or the absence of a stop
-// function) instead of from the actual in-flight set.
+// publishPendingLocked records an entry as work this instance still owes a
+// judgement for. Re-publishing the same entry is a no-op, so a caller cannot
+// make the list grow by retrying.
+func (s *State) publishPendingLocked(entry *drainEntry) {
+	if entry == nil {
+		return
+	}
+	for _, existing := range s.orphanDrains {
+		if existing == entry {
+			return
+		}
+	}
+	s.orphanDrains = append(s.orphanDrains, entry)
+}
+
+// drain performs one bounded drain judgement and counts it. It is the single
+// place both Quiesce and Shutdown go through, so a repeat call cannot answer
+// from an inference (phase, or the absence of a stop function) instead of from
+// the actual in-flight set.
 //
 // "No stop function" is NOT proof of an empty set. A stop can have been
-// replaced by a reconfigure, or installed after a quiesce had already
-// begun, and either way a callback it left running outlives it. Those stops
-// are kept in orphanDrains and re-judged on every call, so a drain can only
+// replaced by a reconfigure, or refused by an instance that was no longer
+// active, and either way a callback it left running outlives it. Those entries
+// stay in orphanDrains and are re-judged on every call, so a drain can only
 // report success when EVERY stop this instance ever installed agrees nothing
 // is running.
 //
 // The wait stays bounded by each stop's own budget, so a host that never
-// returns still results in a clear failure rather than a wedged hot
-// replace.
-func (s *State) drain(stop func() drainOutcome) error {
+// returns still results in a clear failure rather than a wedged hot replace.
+func (s *State) drain(live *drainEntry, pending []*drainEntry) error {
 	s.mu.Lock()
 	s.drainAttempts++
-	orphans := append([]func() drainOutcome(nil), s.orphanDrains...)
 	s.mu.Unlock()
 
+	return s.drainEntries(append([]*drainEntry{live}, pending...))
+}
+
+// drainEntries judges each entry once, reclaims the ones it confirmed drained,
+// and reports the rest as a bounded-drain failure.
+//
+// Reclamation is by identity against the live list rather than by overwriting
+// it with the snapshot: an entry a concurrent Register appended while this
+// drain was running is not in the snapshot and must survive, and an entry that
+// reported "not drained" must stay so the next call re-judges it.
+func (s *State) drainEntries(entries []*drainEntry) error {
 	var failures []error
-	if stop != nil {
-		if outcome := stop(); !outcome.drained {
-			failures = append(failures, outcome.errDrainTimeout())
+	var confirmed []*drainEntry
+	for _, entry := range entries {
+		if entry == nil {
+			continue
 		}
+		outcome := entry.judge()
+		if outcome.drained {
+			confirmed = append(confirmed, entry)
+			continue
+		}
+		failures = append(failures, outcome.errDrainTimeout())
 	}
-	for _, orphan := range orphans {
-		if outcome := orphan(); !outcome.drained {
-			failures = append(failures, outcome.errDrainTimeout())
-		}
+	if len(confirmed) > 0 {
+		s.reclaim(confirmed...)
 	}
 	return errors.Join(failures...)
 }
 
-// retainUndrainedLocked parks a stop whose drain did not finish, so a later
-// drain re-judges it even after the stop itself has been replaced.
+// reclaim removes entries a drain confirmed drained from the pending list.
 //
-// Only a FAILED drain is retained: a stop that reported success has no
-// in-flight call of its own left, and keeping it would make every future
-// drain re-wait on a dead collector.
-func (s *State) retainUndrainedLocked(stop func() drainOutcome, drained bool) {
-	if stop == nil || drained {
+// Only the confirmed entries leave; anything else in the list -- work that
+// failed this drain, or an entry another goroutine published meanwhile -- is
+// left untouched. This is what keeps the list proportional to outstanding work
+// instead of to how many times the instance was reconfigured.
+func (s *State) reclaim(entries ...*drainEntry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.orphanDrains) == 0 {
 		return
 	}
-	// Duplicate retention is harmless -- the stop is idempotent and would
-	// simply be judged twice -- but comparing func values is not possible in
-	// Go beyond a nil check, so callers rely on inserting each stop at most
-	// once by construction (Register and SetCollector each own one).
-	s.orphanDrains = append(s.orphanDrains, stop)
+	keep := s.orphanDrains[:0]
+	for _, entry := range s.orphanDrains {
+		if !drainEntryIn(entries, entry) {
+			keep = append(keep, entry)
+		}
+	}
+	// Drop the tail's references: the slice is reused by append, and a dead
+	// stop's closure (its bridge, done/cancel channels, timer) would otherwise
+	// stay reachable from the backing array after it left the list.
+	for i := len(keep); i < len(s.orphanDrains); i++ {
+		s.orphanDrains[i] = nil
+	}
+	s.orphanDrains = keep
+}
+
+// drainEntryIn reports whether entry is one of the given set.
+func drainEntryIn(set []*drainEntry, entry *drainEntry) bool {
+	for _, candidate := range set {
+		if candidate == entry {
+			return true
+		}
+	}
+	return false
 }
 
 // DrainAttempts reports how many bounded drain judgements this instance has
@@ -351,6 +497,15 @@ func (s *State) DrainAttempts() uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.drainAttempts
+}
+
+// pendingCount reports how many detached collectors this instance still owes a
+// drain judgement for. A test uses it to prove reclamation happens; nothing in
+// the plugin depends on its value.
+func (s *State) pendingCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.orphanDrains)
 }
 
 // Provider returns the quota provider while the instance accepts new work.
@@ -395,25 +550,32 @@ func (s *State) Config() Config {
 // A collector already installed is replaced without being stopped: the caller
 // that replaces one owns stopping the old one, which is what Register does
 // before calling this (it must, because stopping under this lock would wait on
-// a goroutine that may be inside the plugin).
+// a goroutine that may be inside the plugin). The replaced collector is still
+// published as pending work, so a drain sees the collector that is no longer
+// live instead of losing it.
 func (s *State) SetCollector(stop func() drainOutcome) {
 	if stop == nil {
 		return
 	}
+	entry := newDrainEntry(stop)
 	s.mu.Lock()
 	if s.phase == PhaseActive {
-		s.collectStop = stop
+		if replaced := s.collectStop; replaced != nil && replaced != entry {
+			s.publishPendingLocked(replaced)
+		}
+		s.collectStop = entry
 		s.mu.Unlock()
 		return
 	}
+	// Refused: the instance is not accepting work, so this collector must be
+	// stopped at once. Publishing it here, before the stop runs, is the second
+	// half of the same fix as Register's: from the moment it is refused it is
+	// this instance's outstanding work, and a concurrent drain must not read an
+	// empty set while its stop is still waiting inside the host.
+	s.publishPendingLocked(entry)
 	s.mu.Unlock()
-	// Installed onto an instance that is not accepting work: stop it at once.
-	// If that stop cannot finish, the work it leaves behind belongs to this
-	// instance and must stay visible to later drains; dropping the result here
-	// is the same false success as answering from the phase.
-	if outcome := stop(); !outcome.drained {
-		s.mu.Lock()
-		s.retainUndrainedLocked(stop, false)
-		s.mu.Unlock()
-	}
+
+	// The stop runs outside the lock: it is host code that may inspect this
+	// very instance.
+	s.drainEntries([]*drainEntry{entry})
 }

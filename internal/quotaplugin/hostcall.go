@@ -291,6 +291,12 @@ type drainOutcome struct {
 	drained bool
 	// pending is the number of calls still running when the budget expired.
 	pending int
+	// unsettled reports that the stop's result is not known because another
+	// caller is inside it right now. It is a failure, not an empty set: the
+	// collector the stop stands for may still have a callback inside the host,
+	// and inferring success from work whose result nobody has seen is exactly
+	// the false success that makes a host unload a live library.
+	unsettled bool
 }
 
 // errDrainTimeout reports a collection that could not be drained.
@@ -299,6 +305,11 @@ type drainOutcome struct {
 // callbacks holding a credential, and none of that may reach a log or a
 // response (SPEC 4.2).
 func (o drainOutcome) errDrainTimeout() error {
+	if o.unsettled {
+		// No count is quoted because none was observed: another lifecycle call
+		// is inside this collector's stop, and its answer is what decides.
+		return fmt.Errorf("%w: a collection stop is still in progress", ErrQuiesceIncomplete)
+	}
 	return fmt.Errorf("%w: %d collection host call(s) still running", ErrQuiesceIncomplete, o.pending)
 }
 
