@@ -49,18 +49,40 @@ func ParseConfig(raw []byte) (Config, error) {
 		if value == "" {
 			continue
 		}
-		seconds, errParse := strconv.Atoi(value)
-		if errParse != nil {
-			return cfg, fmt.Errorf("config line %d: interval_seconds must be an integer: %w", lineNo, errParse)
+		seconds, okInteger := parsePositiveInt(value)
+		if !okInteger {
+			// Deliberately not wrapping an *strconv.NumError: it carries the
+			// offending value, and this message reaches the registration
+			// response and the management UI. Only the field name, line and
+			// expected type are reported (SPEC 4.2).
+			return cfg, fmt.Errorf("config line %d: interval_seconds must be a positive integer", lineNo)
 		}
-		if seconds > 0 {
-			cfg.IntervalSeconds = seconds
-		}
+		cfg.IntervalSeconds = seconds
 	}
 	if errScan := scanner.Err(); errScan != nil {
 		return cfg, fmt.Errorf("read config: %w", errScan)
 	}
 	return cfg, nil
+}
+
+// parsePositiveInt reports whether value is a base-10 integer greater than
+// zero. It exists so the caller never sees the strconv error, which embeds the
+// offending input.
+func parsePositiveInt(value string) (int, bool) {
+	for index := 0; index < len(value); index++ {
+		if value[index] < '0' || value[index] > '9' {
+			return 0, false
+		}
+	}
+	seconds, errParse := strconv.Atoi(value)
+	if errParse != nil {
+		// Out of range for int.
+		return 0, false
+	}
+	if seconds <= 0 {
+		return 0, false
+	}
+	return seconds, true
 }
 
 // stripComment removes a trailing `#` comment that is not inside quotes.

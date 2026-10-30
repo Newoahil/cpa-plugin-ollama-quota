@@ -5,6 +5,7 @@ package quotaplugin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -97,6 +98,11 @@ func (h *Handler) handleRegister(raw []byte) ([]byte, error) {
 		return ErrorEnvelope("invalid_request", "decode lifecycle request: "+errUnmarshal.Error()), nil
 	}
 	cfg, errConfig := h.state.Register(req.ConfigYAML)
+	if errors.Is(errConfig, ErrStopped) {
+		// The host retired this instance; reporting a capability set would let
+		// it start routing quota calls to a dead library.
+		return ErrorEnvelope("plugin_stopped", ErrStopped.Error()), nil
+	}
 
 	reg := Registration{
 		SchemaVersion: SchemaVersion,
@@ -106,7 +112,9 @@ func (h *Handler) handleRegister(raw []byte) ([]byte, error) {
 	if errConfig != nil {
 		// Keep the plugin loadable: the host drops a registration that
 		// errors, and a YAML typo should not take the quota page down. The
-		// message shows up as a config field in the management UI.
+		// message shows up as a config field in the management UI, so it must
+		// not carry the offending value (SPEC 4.2) — ParseConfig only reports
+		// the field name, line and expected type.
 		reg.Metadata.ConfigFields = append(reg.Metadata.ConfigFields, pluginapi.ConfigField{
 			Name:        "config_error",
 			Type:        pluginapi.ConfigFieldTypeString,

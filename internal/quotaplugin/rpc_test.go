@@ -89,6 +89,23 @@ func TestRegisterSurvivesInvalidConfig(t *testing.T) {
 	}
 }
 
+// The registration response is what the management UI renders, so the whole
+// encoded envelope is checked for the canary — not just the description field.
+func TestRegisterConfigErrorDoesNotLeakInput(t *testing.T) {
+	const canary = "fixture-secret-canary"
+	raw, err := newHandlerForTest(t).Handle(pluginabi.MethodPluginRegister,
+		registerPayload(t, "interval_seconds: "+canary+"\n"))
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if strings.Contains(string(raw), canary) {
+		t.Fatalf("registration response leaks the config value: %s", raw)
+	}
+	if !strings.Contains(string(raw), "config_error") {
+		t.Fatalf("registration response should still report the config error: %s", raw)
+	}
+}
+
 func TestQuotaIdentifier(t *testing.T) {
 	raw, err := newRegisteredHandler(t).Handle(pluginabi.MethodQuotaIdentifier, nil)
 	if err != nil {

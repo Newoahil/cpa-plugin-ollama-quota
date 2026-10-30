@@ -2,6 +2,7 @@ package quotaplugin
 
 import (
 	"context"
+	"errors"
 	"sync"
 )
 
@@ -15,7 +16,8 @@ const (
 	PhaseActive
 	// PhaseQuiescing refuses new work while in-flight work drains.
 	PhaseQuiescing
-	// PhaseStopped is terminal for this library instance.
+	// PhaseStopped is terminal for this library instance: nothing may move it
+	// out of this phase, including a late register from the host.
 	PhaseStopped
 )
 
@@ -34,15 +36,36 @@ func (p Phase) String() string {
 	}
 }
 
+// ErrStopped is returned by Register on an instance that has been shut down.
+// Shutdown is terminal by contract, so a re-register cannot resurrect the
+// instance and start serving quota from a library the host already retired.
+var ErrStopped = errors.New("plugin instance is stopped")
+
 // State tracks one loaded plugin instance across the register / quiesce /
 // shutdown cycle the host drives.
 //
-// register → active; quiesce → quiescing (new work refused, in-flight work
-// cancelled); shutdown → stopped. The collector added in #2 registers its
-// cancellation through collectStop so quiesce can stop it before the host
-// unloads the library.
+// Allowed transitions — nothing else is legal:
+//
+//	new       --register--> active
+//	active    --register--> active      (reconfigure on hot reload)
+//	quiescing --register--> active      (hot-reload retry / rollback)
+//	active    --quiesce-->  quiescing   (idempotent: quiescing -> quiescing)
+//	quiescing --quiesce-->  quiescing
+//	*         --shutdown--> stopped     (terminal; quiesce runs first)
+//
+// Every phase change and its side effects (re-arming or cancelling the quota
+// provider, stopping the collector) happen under the same lock. Splitting them
+// lets a concurrent Register observe the new phase while the provider is still
+// cancelled — active phase, provider refusing work — which is what the review
+// reproduced. Holding the lock across the side effects costs a short critical
+// section and buys a state that cannot lie about itself.
+//
+// Because the lock covers side effects, the collector stop function must not
+// call back into State: it would deadlock. A context.CancelFunc satisfies this;
+// a stop function that wants to inspect the plugin should signal its own
+// goroutine instead of calling in.
 type State struct {
-	mu          sync.RWMutex
+	mu          sync.Mutex
 	phase       Phase
 	provider    *Provider
 	config      Config
@@ -59,35 +82,41 @@ func NewState() *State {
 }
 
 // Register applies the config CPA passed and re-arms the instance. The host
-// calls it on first load and again on hot reload, so a previous quiesce must
-// not leak into the new incarnation.
+// calls it on first load and again on hot reload; a register after quiesce is
+// how a failed hot-swap rolls back, so that path stays open. A register after
+// shutdown is refused because PhaseStopped is terminal.
 func (s *State) Register(configYAML []byte) (Config, error) {
 	cfg, errConfig := ParseConfig(configYAML)
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.phase == PhaseStopped {
+		return s.config, ErrStopped
+	}
 	s.phase = PhaseActive
 	s.config = cfg
-	s.mu.Unlock()
-
 	s.provider.Reset()
+
 	return cfg, errConfig
 }
 
-// Quiesce refuses new work and stops in-flight work. Returns the phase it was
-// in before the call, which tests use to prove idempotence.
+// Quiesce refuses new work and stops in-flight work. It returns the phase it
+// was in before the call, which tests use to prove idempotence.
+//
+// The phase change, the collector stop and the provider cancellation all run
+// under one lock, so a concurrent Register sees either the whole pre-quiesce
+// state or the whole post-quiesce state, never a mixture.
 func (s *State) Quiesce() Phase {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	previous := s.phase
 	if previous == PhaseStopped || previous == PhaseQuiescing {
-		s.mu.Unlock()
 		return previous
 	}
 	s.phase = PhaseQuiescing
-	stop := s.collectStop
-	s.collectStop = nil
-	s.mu.Unlock()
-
-	if stop != nil {
+	if stop := s.collectStop; stop != nil {
+		s.collectStop = nil
 		stop()
 	}
 	s.provider.CancelAll()
@@ -96,16 +125,24 @@ func (s *State) Quiesce() Phase {
 
 // Shutdown is quiesce plus the terminal phase transition.
 func (s *State) Shutdown() {
-	s.Quiesce()
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.phase == PhaseStopped {
+		return
+	}
 	s.phase = PhaseStopped
-	s.mu.Unlock()
+	if stop := s.collectStop; stop != nil {
+		s.collectStop = nil
+		stop()
+	}
+	s.provider.CancelAll()
 }
 
 // Provider returns the quota provider while the instance accepts new work.
 func (s *State) Provider() (*Provider, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.phase != PhaseActive {
 		return nil, false
 	}
@@ -114,30 +151,41 @@ func (s *State) Provider() (*Provider, bool) {
 
 // Active reports whether the instance accepts new work.
 func (s *State) Active() bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.phase == PhaseActive
 }
 
 // Phase reports the current lifecycle phase.
 func (s *State) Phase() Phase {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.phase
 }
 
-// Config reports the config applied at the last register.
+// Config reports the config applied at the last successful register.
 func (s *State) Config() Config {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.config
 }
 
 // SetCollector registers the cancellation function for the background
-// collector. It is never nil-safe by design: #2 replaces the placeholder
-// collector, not this entry point.
+// collector. #2 installs the real collector here; quiesce and shutdown call it
+// before the host unloads the library.
+//
+// A collector installed on an already-quiesced instance is stopped
+// immediately: the instance is not accepting work, so a collector must not
+// start collecting.
 func (s *State) SetCollector(stop context.CancelFunc) {
+	if stop == nil {
+		return
+	}
 	s.mu.Lock()
-	s.collectStop = stop
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	if s.phase == PhaseActive {
+		s.collectStop = stop
+		return
+	}
+	stop()
 }
