@@ -167,8 +167,7 @@ func (h *Handler) handleFetch(raw []byte) ([]byte, error) {
 }
 
 func (h *Handler) handleReset(raw []byte) ([]byte, error) {
-	provider, ok := h.state.Provider()
-	if !ok {
+	if !h.state.Active() {
 		return ErrorEnvelope("plugin_quiesced", "plugin is quiescing"), nil
 	}
 	var req pluginapi.QuotaResetRequest
@@ -176,7 +175,6 @@ func (h *Handler) handleReset(raw []byte) ([]byte, error) {
 		return ErrorEnvelope("invalid_request", "decode quota reset request: "+errUnmarshal.Error()), nil
 	}
 	// Reset stays unsupported until a real provider can honour it.
-	_ = provider
 	return OKEnvelope(pluginapi.QuotaResetResponse{
 		Success: false,
 		Message: "reset is not supported for Ollama quota",

@@ -112,6 +112,13 @@ func (s *State) Provider() (*Provider, bool) {
 	return s.provider, true
 }
 
+// Active reports whether the instance accepts new work.
+func (s *State) Active() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.phase == PhaseActive
+}
+
 // Phase reports the current lifecycle phase.
 func (s *State) Phase() Phase {
 	s.mu.RLock()
