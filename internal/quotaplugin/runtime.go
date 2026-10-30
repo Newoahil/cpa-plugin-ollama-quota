@@ -89,11 +89,15 @@ func NewRuntime() *Runtime {
 // call still has to arrive; stopping it now would retire a generation the host
 // is still holding, and a failed replacement that rolls back to it would find a
 // stopped instance.
-func (r *Runtime) Init() *Handler {
+//
+// hostCall is this generation's host callback bridge (see Handler.hostCall). It
+// is per generation because a generation belongs to one loaded host client, and
+// a retired generation must not keep issuing callbacks through a live one.
+func (r *Runtime) Init(hostCall HostCall) *Handler {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.generation++
-	fresh := NewHandler(NewState())
+	fresh := NewHandlerWithHost(NewStateFor(hostCall), hostCall)
 	r.current = fresh
 	r.live = append(r.live, fresh)
 	return fresh

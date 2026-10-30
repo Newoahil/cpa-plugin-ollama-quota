@@ -74,32 +74,99 @@ type State struct {
 	provider    *Provider
 	config      Config
 	collectStop context.CancelFunc
+	// collectorStart starts the background collector and installs its stop
+	// function. Register calls it on every transition into active; a nil hook
+	// means this instance runs without a collector (tests that only exercise
+	// the lifecycle).
+	collectorStart func(Config)
 }
 
 // NewState returns a state ready for its first register call.
+//
+// It runs without a host bridge, so a quota call on it fails with
+// host_unavailable. Tests that drive the lifecycle never reach the network;
+// tests that do use NewStateFor.
 func NewState() *State {
-	return &State{
+	return NewStateFor(nil)
+}
+
+// NewStateFor returns a state whose provider collects through hostCall.
+//
+// The collector is always installed, so register and quiesce drive a real
+// timer. A nil hostCall leaves the timer running but every sweep fails its
+// first callback, which is the honest behaviour for a plugin loaded without a
+// host table.
+func NewStateFor(hostCall HostCall) *State {
+	provider := NewProvider(ProviderOptions{HostCall: hostCall})
+	state := &State{
 		phase:    PhaseNew,
-		provider: NewProvider(),
+		provider: provider,
 		config:   Config{IntervalSeconds: defaultIntervalSeconds},
 	}
+	state.collectorStart = func(cfg Config) {
+		state.SetCollector(provider.startCollector(cfg))
+	}
+	return state
+}
+
+// newStateWithoutCollector returns a state whose provider collects on demand
+// but which starts no background timer.
+//
+// Tests that assert exact upstream request counts use it: the collector's
+// immediate first sweep would race them for that count. The timer itself is
+// covered by the collector tests, which are the only place that needs it.
+func newStateWithoutCollector(hostCall HostCall) *State {
+	return &State{
+		phase:    PhaseNew,
+		provider: NewProvider(ProviderOptions{HostCall: hostCall}),
+		config:   Config{IntervalSeconds: defaultIntervalSeconds},
+	}
+}
+
+// SetCollectorStarter installs the hook Register uses to start the background
+// collector. The hook must install the stop function through SetCollector; a
+// nil hook disables the collector entirely, which is what tests that assert
+// exact upstream request counts need.
+func (s *State) SetCollectorStarter(start func(Config)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.collectorStart = start
 }
 
 // Register applies the config CPA passed and re-arms the instance. The host
 // calls it on first load and again on hot reload; a register after quiesce is
 // how a failed hot-swap rolls back, so that path stays open. A register after
 // shutdown is refused because PhaseStopped is terminal.
+//
+// Any collector from the previous configuration is stopped and replaced, so a
+// reconfigure with a new interval does not leave the old timer running.
 func (s *State) Register(configYAML []byte) (Config, error) {
 	cfg, errConfig := ParseConfig(configYAML)
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.phase == PhaseStopped {
-		return s.config, ErrStopped
+		s.mu.Unlock()
+		return cfg, ErrStopped
 	}
+	stopPrevious := s.takeCollectorLocked()
 	s.phase = PhaseActive
 	s.config = cfg
 	s.provider.Reset()
+	start := s.collectorStart
+	s.mu.Unlock()
+
+	// The stop function is code this package owns only nominally: it cancels a
+	// context and waits for a goroutine that may be mid-request. It must run
+	// outside the lock, exactly like the one quiesce calls.
+	if stopPrevious != nil {
+		stopPrevious()
+	}
+	if start != nil {
+		// start installs its own stop function through SetCollector, which stops
+		// it immediately if the instance is no longer active (a quiesce that beat
+		// the register).
+		start(cfg)
+	}
 
 	return cfg, errConfig
 }
@@ -184,12 +251,17 @@ func (s *State) Config() Config {
 }
 
 // SetCollector registers the cancellation function for the background
-// collector. #2 installs the real collector here; quiesce and shutdown call it
-// before the host unloads the library.
+// collector. Register installs the real collector through it; quiesce and
+// shutdown call it before the host unloads the library.
 //
 // A collector installed on an instance that is not accepting work is stopped
 // immediately, outside the lock, so the caller cannot deadlock by inspecting
 // the plugin from inside stop.
+//
+// A collector already installed is replaced without being stopped: the caller
+// that replaces one owns stopping the old one, which is what Register does
+// before calling this (it must, because stopping under this lock would wait on
+// a goroutine that may be inside the plugin).
 func (s *State) SetCollector(stop context.CancelFunc) {
 	if stop == nil {
 		return
