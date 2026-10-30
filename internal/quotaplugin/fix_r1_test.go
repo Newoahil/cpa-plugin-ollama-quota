@@ -82,7 +82,7 @@ func TestQuiesceWaitsForRunningCancelCallback(t *testing.T) {
 	host := newFixtureHost()
 	host.setCredential("cred-1", map[string]any{"type": "ollama", "api_key": "fixture-key"})
 	host.setBlock()
-	cancelEntered, releaseCancel := host.setCancelHold()
+	cancelEntered, releaseCancel, _ := host.setCancelHold()
 
 	provider := NewProvider(ProviderOptions{HostCall: host.call, Timeout: 200 * time.Millisecond})
 	state := NewStateFor(host.call)

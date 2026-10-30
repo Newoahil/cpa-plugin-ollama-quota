@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
@@ -51,6 +52,10 @@ type hostBridge struct {
 	// thing this plugin does that outlives the goroutine that started it, so it
 	// is the only thing that has to be drained before the library is unloaded.
 	inflight inflightSet
+	// drainChecks counts waitInflight calls that actually examined the
+	// in-flight set. It is a diagnostic: it lets a test tell a real drain
+	// judgement apart from one that answered from cached state.
+	drainChecks atomic.Uint64
 }
 
 // inflightSet counts outstanding host calls and offers a channel that is closed
@@ -134,6 +139,11 @@ func (s *inflightSet) freeze() <-chan struct{} {
 // synchronous C call), so the barrier has to be reusable: a later quiesce
 // must be able to observe the same still-running call and fail again rather
 // than report an empty set it never actually drained.
+//
+// Thawing must NOT discard the idle channel's identity: a call that was
+// already registered keeps counting against the same channel, so the next
+// attempt observes it going to zero instead of starting from a fresh, empty
+// set that would look drained.
 func (s *inflightSet) thaw() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -246,6 +256,7 @@ func (b *hostBridge) waitInflight(ctx context.Context) drainOutcome {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	b.drainChecks.Add(1)
 	idle := b.inflight.freeze()
 	select {
 	case <-idle:
@@ -255,6 +266,16 @@ func (b *hostBridge) waitInflight(ctx context.Context) drainOutcome {
 		b.inflight.thaw()
 		return drainOutcome{pending: pending}
 	}
+}
+
+// DrainChecks reports how many times this bridge actually examined its
+// in-flight set. Nothing in the plugin depends on it; tests use it to prove
+// a drain judgement really happened.
+func (b *hostBridge) DrainChecks() uint64 {
+	if b == nil {
+		return 0
+	}
+	return b.drainChecks.Load()
 }
 
 // drainOutcome is what a collector stop reports about the host calls it could

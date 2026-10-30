@@ -83,6 +83,10 @@ type fixtureHost struct {
 	// the host while it checks the quiesce barrier (P1-b).
 	cancelEntered chan struct{}
 	cancelRelease chan struct{}
+	// cancelExited closes when a held cancel callback returns. A test uses it
+	// to wait for the callback to genuinely leave the host, instead of
+	// assuming a release implies an exit (P1-b round 3).
+	cancelExited chan struct{}
 	// authGetBlock, when non-nil, parks host.auth.get until it is closed (P2-1).
 	authGetBlock chan struct{}
 	// authGetHadDeadline records whether the last host.auth.get arrived with a
@@ -206,6 +210,14 @@ func (f *fixtureHost) call(ctxOfCall context.Context, method string, request []b
 				<-release
 			}
 			f.mu.Lock()
+			if f.cancelExited != nil {
+				exited := f.cancelExited
+				select {
+				case <-exited:
+				default:
+					close(exited)
+				}
+			}
 			return okResult(struct{}{})
 		}
 		// Releasing the blocker is what a real cancel does: the in-flight
@@ -381,19 +393,21 @@ func (f *fixtureHost) setBlockCleared() {
 // setCancelHold parks the host.http.cancel callback inside the host. It returns
 // a channel that closes once the callback is inside, and the release function
 // the test calls to let it finish.
-func (f *fixtureHost) setCancelHold() (entered <-chan struct{}, release func()) {
+func (f *fixtureHost) setCancelHold() (entered <-chan struct{}, release func(), exited <-chan struct{}) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.cancelEntered = make(chan struct{})
 	f.cancelRelease = make(chan struct{})
+	f.cancelExited = make(chan struct{})
 	releaseCh := f.cancelRelease
+	exitedCh := f.cancelExited
 	return f.cancelEntered, func() {
 		select {
 		case <-releaseCh:
 		default:
 			close(releaseCh)
 		}
-	}
+	}, exitedCh
 }
 
 // setBlock installs a blocker that parks every HTTP callback until it is closed

@@ -31,7 +31,11 @@ func TestQuiesceAndRegisterCannotInterleave(t *testing.T) {
 	enteredStop := make(chan struct{})
 	releaseStop := make(chan struct{})
 	state.SetCollector(func() drainOutcome {
-		close(enteredStop)
+		select {
+		case <-enteredStop:
+		default:
+			close(enteredStop)
+		}
 		<-releaseStop
 		return drainOutcome{drained: true}
 	})

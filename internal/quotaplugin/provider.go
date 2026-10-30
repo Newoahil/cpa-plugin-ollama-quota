@@ -215,27 +215,26 @@ func (p *Provider) startCollector(cfg Config) func() drainOutcome {
 		// stopped starting new calls.
 		deadline := time.Now().Add(waitBudget)
 
-		// The waiter exists so the select can see the collector exit. When the
-		// timeout branch fires it is still parked on <-done, and that is
-		// deliberate: it is how the collector's eventual exit is observed
-		// without the stop blocking on it. It is one goroutine per stop, it
-		// ends when the collector finishes, and it does not accumulate per
-		// refresh (SPEC 4.4 is about the collector's own count).
-		stopped := make(chan struct{})
-		go func() {
-			<-done
-			close(stopped)
-		}()
+		// done is closed by the collector goroutine itself, so the select can
+		// watch it directly. No waiter goroutine is needed, and a repeated
+		// stop (a retried quiesce) therefore costs nothing extra.
 		select {
-		case <-stopped:
+		case <-done:
 		case <-time.After(time.Until(deadline)):
 			// The collector goroutine is still parked in a host call. Report
 			// that rather than pretending the stop finished; the goroutine is
 			// left to unwind on its own so it cannot leak into the next
-			// generation.
+			// generation. The in-flight set is not consulted here: the
+			// goroutine has not stopped starting calls yet, so its count is not
+			// a settled answer.
 			return drainOutcome{pending: 1}
 		}
 
+		// The collector goroutine is gone. That is necessary but not enough:
+		// a cancel callback it spawned can still be inside a host call, so the
+		// in-flight set decides. This is also what makes a retried stop
+		// meaningful -- on the second call the goroutine is usually already
+		// done, and the answer comes entirely from the in-flight set.
 		if bridge == nil {
 			return drainOutcome{drained: true}
 		}

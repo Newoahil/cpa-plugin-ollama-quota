@@ -80,7 +80,7 @@ func TestQuiesceReportsIncompleteDrainAtRPC(t *testing.T) {
 	host := newFixtureHost()
 	host.setCredential("cred-1", map[string]any{"type": "ollama", "api_key": "fixture-key"})
 	host.setBlock()
-	cancelEntered, releaseCancel := host.setCancelHold()
+	cancelEntered, releaseCancel, _ := host.setCancelHold()
 	t.Cleanup(releaseCancel)
 
 	state := NewStateFor(host.call)

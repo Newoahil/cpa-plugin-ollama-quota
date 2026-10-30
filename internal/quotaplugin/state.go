@@ -75,14 +75,24 @@ var ErrQuiesceIncomplete = errors.New("quiesce could not drain in-flight collect
 // "active" while the provider is still cancelled. That is the invariant the
 // review broke. The collector stop function is the one exception — it is code
 // we did not write, and calling it under the lock means any call back into
-// State deadlocks. It is collected under the lock (so stop is invoked exactly
-// once) and called after the lock is released.
+// State deadlocks. It is read under the lock and called after it is released.
+//
+// Stop is RETAINED rather than consumed, so a repeated quiesce can re-run the
+// bounded drain against the same in-flight calls. Only Register takes it, and
+// only because a reconfigure genuinely replaces the collector.
 type State struct {
-	mu          sync.Mutex
-	phase       Phase
-	provider    *Provider
-	config      Config
+	mu       sync.Mutex
+	phase    Phase
+	provider *Provider
+	config   Config
+	// collectStop is the installed collector stop. It is RETAINED, not consumed:
+	// a drain that ended with work still running leaves it in place so the next
+	// Quiesce/Shutdown can re-judge the same in-flight calls instead of
+	// concluding "no stop function, therefore nothing running".
 	collectStop func() drainOutcome
+	// drainAttempts counts bounded drain judgements, so a caller (and a test)
+	// can tell a real re-check apart from an early return.
+	drainAttempts uint64
 	// collectorStart starts the background collector and installs its stop
 	// function. Register calls it on every transition into active; a nil hook
 	// means this instance runs without a collector (tests that only exercise
@@ -192,66 +202,112 @@ func (s *State) Register(configYAML []byte) (Config, error) {
 // unload condition right now. Reporting success while a callback still runs
 // would be worse than a longer wait: the host would swap a live library.
 //
-// It returns the phase it was in before the call, plus the drain error. A
-// quiesce that finds the instance already quiescing reports the phase only: a
-// second stop has nothing new to drain, and the first call already told the
-// host the truth.
+// It returns the phase it was in before the call, plus the drain error.
+//
+// A repeated quiesce RE-JUDGES the drain; it does not answer from the phase.
+// PhaseQuiescing only records that a quiesce has started, so an earlier
+// attempt may have given up while a host call was still running. Answering
+// success on a retry because "the first call already said so" is the false
+// success the final review reproduced: the callback never exited, yet the
+// retry reported a library that was safe to unload. The stop function is
+// therefore retained rather than consumed, and every call -- first or
+// repeated -- runs the bounded drain judgement again.
 //
 // The phase change and the provider cancellation happen under one lock. The
-// collector stop is taken under the lock and invoked after it is released.
+// drain runs outside the lock, because stop waits on host calls that may
+// themselves be waiting for this lock.
 func (s *State) Quiesce() (Phase, error) {
 	s.mu.Lock()
 	previous := s.phase
-	if previous == PhaseStopped || previous == PhaseQuiescing {
+	if previous == PhaseStopped {
 		s.mu.Unlock()
 		return previous, nil
 	}
 	s.phase = PhaseQuiescing
-	stop := s.takeCollectorLocked()
 	s.provider.CancelAll()
+	// The stop function is deliberately NOT taken here: it is retained so a retry can re-judge.
+	stop := s.collectStop
 	s.mu.Unlock()
 
-	if stop == nil {
-		return previous, nil
-	}
-	if outcome := stop(); !outcome.drained {
-		return previous, outcome.errDrainTimeout()
-	}
-	return previous, nil
+	// A repeated quiesce re-judges the drain instead of trusting the phase.
+	// PhaseQuiescing only says a quiesce has started; an earlier one may have
+	// given up with a host call still running, and answering nil here is
+	// exactly the false success the review found (a callback that never
+	// exited was reported as safe to unload).
+	return previous, s.drain(stop)
 }
 
 // Shutdown is quiesce plus the terminal phase transition. It reports the same
 // bounded-drain failure Quiesce does; the phase is stopped regardless, so a
 // caller cannot accidentally keep using this instance.
+//
+// Like Quiesce, a repeated shutdown re-judges the drain rather than answering
+// from the already-stopped phase. Being stopped says nothing about whether a
+// host call is still running, and that is the property the host needs before
+// it unloads.
 func (s *State) Shutdown() error {
 	s.mu.Lock()
-	if s.phase == PhaseStopped {
-		s.mu.Unlock()
+	previous := s.phase
+	s.phase = PhaseStopped
+	s.provider.CancelAll()
+	stop := s.collectStop
+	s.mu.Unlock()
+
+	if previous == PhaseStopped && stop == nil {
 		return nil
 	}
-	s.phase = PhaseStopped
-	stop := s.takeCollectorLocked()
-	s.provider.CancelAll()
+	// Shutdown is terminal either way: the phase stays stopped so nothing can
+	// revive this instance. The error only reports that the drain did not
+	// finish, which the host needs before it unloads. A repeated shutdown
+	// re-judges the same way Quiesce does, for the same reason.
+	return s.drain(stop)
+}
+
+// takeCollectorLocked detaches the collector stop function. ONLY Register uses
+// it, because a reconfigure genuinely replaces the collector and the old one
+// must not be drained twice.
+//
+// Quiesce and Shutdown must NOT use it: consuming the stop function there is
+// what made a failed drain unrecoverable. Once it was nil, a retry saw "no
+// stop function" and reported success while the callback was still running.
+func (s *State) takeCollectorLocked() func() drainOutcome {
+	stop := s.collectStop
+	s.collectStop = nil
+	return stop
+}
+
+// drain performs one bounded drain judgement and counts it.
+//
+// It is the single place both Quiesce and Shutdown go through, so a repeat
+// call cannot answer from an inference (phase, or the absence of a stop
+// function) instead of from the actual in-flight set. A nil stop means this
+// instance never ran a collector; that is the one case where there is
+// nothing to judge and success is honest.
+//
+// The wait stays bounded by the collector's own budget, so a host that never
+// returns still results in a clear failure rather than a wedged hot
+// replace.
+func (s *State) drain(stop func() drainOutcome) error {
+	s.mu.Lock()
+	s.drainAttempts++
 	s.mu.Unlock()
 
 	if stop == nil {
 		return nil
 	}
-	// Shutdown is terminal either way: the phase stays stopped so nothing
-	// can revive this instance. The error only reports that the drain did
-	// not finish, which the host needs to know before it unloads.
 	if outcome := stop(); !outcome.drained {
 		return outcome.errDrainTimeout()
 	}
 	return nil
 }
 
-// takeCollectorLocked detaches the collector stop function so it is called
-// exactly once. The caller must invoke it after releasing the lock.
-func (s *State) takeCollectorLocked() func() drainOutcome {
-	stop := s.collectStop
-	s.collectStop = nil
-	return stop
+// DrainAttempts reports how many bounded drain judgements this instance has
+// run. It exists so a caller can tell a real re-check apart from an early
+// return; nothing in the plugin depends on its value.
+func (s *State) DrainAttempts() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.drainAttempts
 }
 
 // Provider returns the quota provider while the instance accepts new work.
