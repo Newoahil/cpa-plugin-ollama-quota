@@ -7,15 +7,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
+	"github.com/LambdaTheory/cpa-plugin-ollama-quota/internal/ollama"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
-// DrainTimeoutCode is the error code lifecycleEnvelope reports when quiesce or
-// shutdown gave up waiting for tracked fetches. It is a stable, greppable value:
-// CPA logs a failed quiesce, and the plugin's own tests assert this code.
 const DrainTimeoutCode = "quiesce_drain_timeout"
+
+type LifecycleResponse struct{}
 
 // Envelope is the RPC frame the host decodes for every plugin call.
 type Envelope struct {
@@ -44,6 +45,19 @@ type LifecycleRequest struct {
 	SchemaVersion uint32 `json:"schema_version"`
 }
 
+// quotaFetchRequest is the payload of quota.fetch.
+//
+// It is pluginapi.QuotaFetchRequest plus the field the host adds to every
+// callback-bearing RPC: rpcQuotaFetchRequest embeds the SDK struct and adds
+// HostCallbackID (internal/pluginhost/rpc_schema.go:136). HostCallbackID is the
+// only handle this plugin gets on the request's transport scope — the SDK's own
+// HTTPClient field is `json:"-"` and cannot cross the C ABI — so it is what
+// every host.http.do issued for this call is bound to.
+type quotaFetchRequest struct {
+	pluginapi.QuotaFetchRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
 // Registration mirrors the host's rpcRegistration schema. Only quota_provider
 // is declared: the plugin does not touch auth, routing, or request paths.
 type Registration struct {
@@ -58,59 +72,29 @@ type RegistrationCapable struct {
 	QuotaProvider bool `json:"quota_provider"`
 }
 
-// lifecycleEnvelope answers plugin.quiesce / plugin.shutdown. A completed drain
-// is a plain success envelope. A timed-out drain is reported as an error with a
-// stable code and a machine-readable detail, so the timeout is observable even
-// though the phase transition itself did happen.
-//
-// CPA v8.0.47 ignores the success flag of plugin.quiesce (host.go callQuiesce
-// discards the bool), so this envelope does NOT stop the host from unloading.
-// What it buys is honesty and a greppable code (`quiesce_drain_timeout`) in the
-// plugin response and the host's warning log; making the host refuse the swap
-// needs a CPA change, which is out of scope for this ticket.
-func (h *Handler) lifecycleEnvelope(report DrainReport) ([]byte, error) {
-	if !report.TimedOut {
-		return OKEnvelope(LifecycleResponse{})
-	}
-	raw, errMarshal := json.Marshal(Envelope{Error: &EnvelopeError{
-		Code:      DrainTimeoutCode,
-		Message:   drainTimeoutMessage(report),
-		Retryable: false,
-		Detail: map[string]any{
-			"in_flight": report.InFlight,
-			"timeout_s": report.Timeout.Seconds(),
-		},
-	}})
-	if errMarshal != nil {
-		// The frame is all strings and numbers; falling back to the error
-		// envelope without detail is still better than a panic in the host.
-		return ErrorEnvelope(DrainTimeoutCode, drainTimeoutMessage(report)), nil
-	}
-	return raw, nil
-}
-
-// drainTimeoutMessage names the condition without any credential material and
-// without claiming the instance is busy: by this point it is already quiescing.
-func drainTimeoutMessage(report DrainReport) string {
-	return fmt.Sprintf(
-		"quiesce drain timed out with %d quota fetch(es) still running after %s; "+
-			"the instance no longer accepts work, but those fetches were not confirmed finished",
-		report.InFlight, report.Timeout)
-}
-
-// LifecycleResponse is the result of a successful plugin.quiesce / shutdown.
-type LifecycleResponse struct{}
-
+// Handler dispatches RPC methods against one plugin instance.
 type Handler struct {
 	state *State
 	// ctx is the parent for RPC work. The C ABI carries no context, so
 	// cancellation flows through quiesce instead of per-call deadlines.
 	ctx context.Context
+	// hostCall is the host callback bridge this generation was initialised
+	// with. It is per generation because the host's callback scope belongs to
+	// one loaded client (see Runtime).
+	hostCall HostCall
 }
 
-// NewHandler returns a handler bound to state.
+// NewHandler returns a handler bound to state, with no host bridge. It exists
+// for the lifecycle tests, which never reach the network; a quota call on such
+// a handler fails with host_unavailable rather than pretending to collect.
 func NewHandler(state *State) *Handler {
 	return &Handler{state: state, ctx: context.Background()}
+}
+
+// NewHandlerWithHost returns a handler bound to state and to the host callback
+// bridge of the generation the host just initialised.
+func NewHandlerWithHost(state *State, hostCall HostCall) *Handler {
+	return &Handler{state: state, ctx: context.Background(), hostCall: hostCall}
 }
 
 // Shutdown retires the instance behind this handler. Later calls that reach
@@ -133,11 +117,10 @@ func (h *Handler) Handle(method string, request []byte) ([]byte, error) {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
 		return h.handleRegister(request)
 	case pluginabi.MethodPluginQuiesce:
-		h.state.Quiesce()
-		return h.lifecycleEnvelope(h.state.LastDrain())
+		_, errDrain := h.state.Quiesce()
+		return h.lifecycleEnvelope(errDrain)
 	case pluginabi.MethodPluginShutdown:
-		h.state.Shutdown()
-		return h.lifecycleEnvelope(h.state.LastDrain())
+		return h.lifecycleEnvelope(h.state.Shutdown())
 	case pluginabi.MethodQuotaIdentifier:
 		return OKEnvelope(IdentifierResponse{Identifier: QuotaIdentifier})
 	case pluginabi.MethodQuotaDescribe:
@@ -153,11 +136,37 @@ func (h *Handler) Handle(method string, request []byte) ([]byte, error) {
 	}
 }
 
+// lifecycleEnvelope reports one combined drain result. CPA v8.0.47 callQuiesce
+// discards the bool: this honestly reports failure, but cannot prevent unload.
+// Use this call's error, since another lifecycle call can overwrite LastDrain.
+func (h *Handler) lifecycleEnvelope(err error) ([]byte, error) {
+	if err == nil {
+		return OKEnvelope(LifecycleResponse{})
+	}
+	var report DrainReport
+	if !errors.As(err, &report) {
+		report.TimedOut = true
+	}
+	return json.Marshal(Envelope{Error: &EnvelopeError{
+		Code:    DrainTimeoutCode,
+		Message: fmt.Sprintf("%s; tracked wait budget %s", report.Error(), report.Timeout),
+		Detail: map[string]any{
+			"in_flight":    report.InFlight,
+			"timeout_s":    report.Timeout.Seconds(),
+			"host_pending": report.HostPending,
+			"unsettled":    report.Unsettled,
+		},
+	}})
+}
+
 func (h *Handler) handleRegister(raw []byte) ([]byte, error) {
 	var req LifecycleRequest
 	if errUnmarshal := decodeOptional(raw, &req); errUnmarshal != nil {
 		return ErrorEnvelope("invalid_request", "decode lifecycle request: "+errUnmarshal.Error()), nil
 	}
+	// The bridge belongs to this handler's generation, so it is installed
+	// before register can start a collector that will need it.
+	h.state.provider.setHostBridge(h.hostCall)
 	cfg, errConfig := h.state.Register(req.ConfigYAML)
 	if errors.Is(errConfig, ErrStopped) {
 		// The host retired this instance; reporting a capability set would let
@@ -207,7 +216,7 @@ func (h *Handler) handleFetch(raw []byte) ([]byte, error) {
 	if !ok {
 		return ErrorEnvelope("plugin_quiesced", "plugin is quiescing"), nil
 	}
-	var req pluginapi.QuotaFetchRequest
+	var req quotaFetchRequest
 	if errUnmarshal := decodeOptional(raw, &req); errUnmarshal != nil {
 		return ErrorEnvelope("invalid_request", "decode quota fetch request: "+errUnmarshal.Error()), nil
 	}
@@ -224,15 +233,50 @@ func (h *Handler) handleFetch(raw []byte) ([]byte, error) {
 	default:
 	}
 
-	sample, errSample := provider.Sample(ProviderKey(req.Provider))
-	if errSample != nil {
-		code := "quota_fetch_failed"
-		if IsUnsupportedProvider(errSample) {
-			code = "unsupported_provider"
-		}
-		return ErrorEnvelope(code, errSample.Error()), nil
+	response, errFetch := provider.fetchQuota(ctx, req.QuotaFetchRequest, req.HostCallbackID)
+	if errFetch != nil {
+		return ErrorEnvelope(fetchErrorCode(errFetch), fetchErrorMessage(errFetch)), nil
 	}
-	return OKEnvelope(sampleResponse(sample))
+	return OKEnvelope(response)
+}
+
+// fetchErrorCode maps a collection failure onto the host's error taxonomy.
+// The codes are the ones the host and the ticket name; only unsupported_provider
+// and invalid_request are acted on by the host today, the rest reach the page as
+// the message text.
+func fetchErrorCode(err error) string {
+	switch {
+	case IsUnsupportedProvider(err):
+		return "unsupported_provider"
+	case errors.Is(err, ErrIncompleteCredential):
+		return "credential_incomplete"
+	case errors.Is(err, ErrHostUnavailable):
+		return "host_unavailable"
+	case errors.Is(err, ollama.ErrRateLimit):
+		return "rate_limited"
+	case errors.Is(err, ollama.ErrAuth):
+		return "auth_failed"
+	case errors.Is(err, ollama.ErrParse):
+		return "parse_failed"
+	case errors.Is(err, ollama.ErrNetwork):
+		return "upstream_unreachable"
+	default:
+		return "quota_fetch_failed"
+	}
+}
+
+// fetchErrorMessage is the text the host puts in its 502 body, so it must be
+// useful and must never carry a credential. Every error this package and the
+// collector produce is already scrubbed (SPEC 4.2); the fallthrough keeps an
+// unrecognised error from being rendered as an empty string.
+func fetchErrorMessage(err error) string {
+	if err == nil {
+		return "the Ollama quota fetch failed"
+	}
+	if message := strings.TrimSpace(err.Error()); message != "" {
+		return message
+	}
+	return "the Ollama quota fetch failed"
 }
 
 func (h *Handler) handleReset(raw []byte) ([]byte, error) {
@@ -243,37 +287,14 @@ func (h *Handler) handleReset(raw []byte) ([]byte, error) {
 	if errUnmarshal := decodeOptional(raw, &req); errUnmarshal != nil {
 		return ErrorEnvelope("invalid_request", "decode quota reset request: "+errUnmarshal.Error()), nil
 	}
-	// Reset stays unsupported until a real provider can honour it.
+	// Ollama has no endpoint that resets a quota window, so this is a definite
+	// refusal rather than a silent success. The host turns a Success=false
+	// answer into a 502 with this message, which is exactly the behaviour a
+	// button that cannot work should have.
 	return OKEnvelope(pluginapi.QuotaResetResponse{
 		Success: false,
-		Message: "reset is not supported for Ollama quota",
+		Message: ErrQuotaResetUnsupported.Error(),
 	})
-}
-
-// sampleResponse maps the placeholder payload onto the host's quota model.
-func sampleResponse(s Sample) pluginapi.QuotaFetchResponse {
-	return pluginapi.QuotaFetchResponse{
-		Subscription: &pluginapi.QuotaSubscription{
-			Plan:     s.Plan,
-			TierName: s.TierName,
-			TierID:   s.TierID,
-		},
-		Summary: []pluginapi.QuotaMetric{{
-			Key:      "balance",
-			Label:    "Balance",
-			Value:    s.BalanceUSD,
-			Format:   "currency",
-			Currency: "USD",
-		}},
-		Groups: []pluginapi.QuotaGroup{{
-			DisplayName: "Ollama",
-			Buckets: []pluginapi.QuotaBucket{{
-				Window:            s.Window,
-				RemainingFraction: s.RemainingFraction,
-				Description:       s.WindowNote,
-			}},
-		}},
-	}
 }
 
 func metadata(cfg Config) pluginapi.Metadata {
@@ -286,7 +307,7 @@ func metadata(cfg Config) pluginapi.Metadata {
 			{
 				Name:        "interval_seconds",
 				Type:        pluginapi.ConfigFieldTypeInteger,
-				Description: "Quota collection interval in seconds (default 900). Read by the collector added in #2.",
+				Description: "Quota collection interval in seconds (default 900).",
 			},
 		},
 	}

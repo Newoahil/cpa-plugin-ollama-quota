@@ -30,14 +30,20 @@ func TestQuiesceAndRegisterCannotInterleave(t *testing.T) {
 
 	enteredStop := make(chan struct{})
 	releaseStop := make(chan struct{})
-	state.SetCollector(func() {
-		close(enteredStop)
+	state.SetCollector(func() drainOutcome {
+		select {
+		case <-enteredStop:
+		default:
+			close(enteredStop)
+		}
 		<-releaseStop
+		return drainOutcome{drained: true}
 	})
 
 	quiesceDone := make(chan Phase, 1)
 	go func() {
-		quiesceDone <- state.Quiesce()
+		phase, _ := state.Quiesce()
+		quiesceDone <- phase
 	}()
 
 	// Wait until Quiesce is provably inside its stop hook. By then the phase is
@@ -202,9 +208,10 @@ func TestCollectorStopCanReenterState(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 	observed := make(chan Phase, 1)
-	state.SetCollector(func() {
+	state.SetCollector(func() drainOutcome {
 		// A real collector would check whether it is being shut down here.
 		observed <- state.Phase()
+		return drainOutcome{drained: true}
 	})
 
 	state.Quiesce()

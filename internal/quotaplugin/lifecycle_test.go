@@ -66,7 +66,11 @@ func TestQuiesceIsIdempotent(t *testing.T) {
 }
 
 func TestRegisterAfterQuiesceReArmsTheInstance(t *testing.T) {
-	h := newHandlerForTest(t)
+	host := newFixtureHost()
+	host.setCredential("cred-1", map[string]any{"type": "ollama", "api_key": "fixture-key"})
+	host.setRespond(balanceOK(balanceBody))
+	h := newHandlerWithHost(t, host)
+	t.Cleanup(func() { h.state.Shutdown() })
 	if _, err := h.Handle(pluginabi.MethodPluginRegister, registerPayload(t, "")); err != nil {
 		t.Fatalf("first register: %v", err)
 	}
@@ -80,7 +84,7 @@ func TestRegisterAfterQuiesceReArmsTheInstance(t *testing.T) {
 	if phase := h.state.Phase(); phase != PhaseActive {
 		t.Fatalf("phase = %s, want active", phase)
 	}
-	raw, err := h.Handle(pluginabi.MethodQuotaFetch, []byte(`{"provider":"ollama"}`))
+	raw, err := h.Handle(pluginabi.MethodQuotaFetch, fetchRequest(t, "cred-1", "ollama"))
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
@@ -113,7 +117,7 @@ func TestQuiesceStopsRegisteredCollector(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 	stopped := false
-	h.state.SetCollector(func() { stopped = true })
+	h.state.SetCollector(func() drainOutcome { stopped = true; return drainOutcome{drained: true} })
 	if _, err := h.Handle(pluginabi.MethodPluginQuiesce, nil); err != nil {
 		t.Fatalf("quiesce: %v", err)
 	}

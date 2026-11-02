@@ -12,8 +12,11 @@ import (
 // fresh instance instead of inheriting the stopped one from the first.
 func TestRuntimeReinitAfterShutdownWorks(t *testing.T) {
 	runtime := NewRuntime()
+	host := newFixtureHost()
+	host.setCredential("cred-1", map[string]any{"type": "ollama", "api_key": "fixture-key"})
+	host.setRespond(balanceOK(balanceBody))
 
-	first := runtime.Init()
+	first := runtime.Init(host.call)
 	if _, err := first.Handle(pluginabi.MethodPluginRegister, registerPayload(t, enabledConfig)); err != nil {
 		t.Fatalf("first register: %v", err)
 	}
@@ -23,7 +26,7 @@ func TestRuntimeReinitAfterShutdownWorks(t *testing.T) {
 	}
 
 	// This is the load that used to fail with "plugin instance is stopped".
-	second := runtime.Init()
+	second := runtime.Init(host.call)
 	if second == first {
 		t.Fatal("Init must build a new handler, not reuse the retired one")
 	}
@@ -47,7 +50,7 @@ func TestRuntimeReinitAfterShutdownWorks(t *testing.T) {
 	}
 
 	// The reinstalled plugin must actually serve quota, not just register.
-	fetchRaw, err := second.Handle(pluginabi.MethodQuotaFetch, []byte(`{"provider":"ollama"}`))
+	fetchRaw, err := second.Handle(pluginabi.MethodQuotaFetch, fetchRequest(t, "cred-1", "ollama"))
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
@@ -65,14 +68,14 @@ func TestRuntimeReinitAfterShutdownWorks(t *testing.T) {
 func TestRuntimeRetiredGenerationRejectsLateRegister(t *testing.T) {
 	runtime := NewRuntime()
 
-	retired := runtime.Init()
+	retired := runtime.Init(nil)
 	if _, err := retired.Handle(pluginabi.MethodPluginRegister, registerPayload(t, enabledConfig)); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	runtime.Shutdown()
 
 	// The host registers the new generation right after Init.
-	live := runtime.Init()
+	live := runtime.Init(nil)
 	if _, err := live.Handle(pluginabi.MethodPluginRegister, registerPayload(t, enabledConfig)); err != nil {
 		t.Fatalf("register on the new generation: %v", err)
 	}
@@ -106,7 +109,7 @@ func TestRuntimeRetiredGenerationRejectsLateRegister(t *testing.T) {
 func TestRuntimeReinitSameFileSameGenerationContent(t *testing.T) {
 	runtime := NewRuntime()
 	for cycle := 1; cycle <= 3; cycle++ {
-		handler := runtime.Init()
+		handler := runtime.Init(nil)
 		raw, err := handler.Handle(pluginabi.MethodPluginRegister, registerPayload(t, enabledConfig))
 		if err != nil {
 			t.Fatalf("cycle %d register: %v", cycle, err)
@@ -140,7 +143,7 @@ func TestRuntimeBeforeInit(t *testing.T) {
 func TestRuntimeShutdownIsIdempotent(t *testing.T) {
 	runtime := NewRuntime()
 
-	handler := runtime.Init()
+	handler := runtime.Init(nil)
 	if _, err := handler.Handle(pluginabi.MethodPluginRegister, registerPayload(t, enabledConfig)); err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -173,14 +176,17 @@ func TestRuntimeShutdownIsIdempotent(t *testing.T) {
 // property that has to hold under either order.
 func TestRuntimeShutdownRetiresOldestGeneration(t *testing.T) {
 	runtime := NewRuntime()
+	host := newFixtureHost()
+	host.setCredential("cred-1", map[string]any{"type": "ollama", "api_key": "fixture-key"})
+	host.setRespond(balanceOK(balanceBody))
 
-	first := runtime.Init()
+	first := runtime.Init(host.call)
 	if _, err := first.Handle(pluginabi.MethodPluginRegister, registerPayload(t, enabledConfig)); err != nil {
 		t.Fatalf("first register: %v", err)
 	}
 	// Hot replacement: the host inits the new client while the old one is still
 	// held, and registers it before the old client is shut down.
-	second := runtime.Init()
+	second := runtime.Init(host.call)
 	if _, err := second.Handle(pluginabi.MethodPluginRegister, registerPayload(t, enabledConfig)); err != nil {
 		t.Fatalf("second register: %v", err)
 	}
@@ -200,7 +206,7 @@ func TestRuntimeShutdownRetiresOldestGeneration(t *testing.T) {
 	if _, ok := second.State().Provider(); !ok {
 		t.Fatal("the live generation must keep serving after the retired client shuts down")
 	}
-	raw, err := second.Handle(pluginabi.MethodQuotaFetch, []byte(`{"provider":"ollama"}`))
+	raw, err := second.Handle(pluginabi.MethodQuotaFetch, fetchRequest(t, "cred-1", "ollama"))
 	if err != nil {
 		t.Fatalf("live fetch: %v", err)
 	}
@@ -227,12 +233,15 @@ func TestRuntimeShutdownRetiresOldestGeneration(t *testing.T) {
 // does not assert which generation the first shutdown retired.
 func TestRuntimeShutdownAfterReplacementKeepsNewestServing(t *testing.T) {
 	runtime := NewRuntime()
+	host := newFixtureHost()
+	host.setCredential("cred-1", map[string]any{"type": "ollama", "api_key": "fixture-key"})
+	host.setRespond(balanceOK(balanceBody))
 
-	first := runtime.Init()
+	first := runtime.Init(host.call)
 	if _, err := first.Handle(pluginabi.MethodPluginRegister, registerPayload(t, enabledConfig)); err != nil {
 		t.Fatalf("first register: %v", err)
 	}
-	second := runtime.Init()
+	second := runtime.Init(host.call)
 	if _, err := second.Handle(pluginabi.MethodPluginRegister, registerPayload(t, enabledConfig)); err != nil {
 		t.Fatalf("second register: %v", err)
 	}
@@ -258,7 +267,7 @@ func TestRuntimeShutdownAfterReplacementKeepsNewestServing(t *testing.T) {
 	} else if envelope := decodeEnvelope(t, raw); !envelope.OK {
 		t.Fatalf("the newest generation must still accept a register: %+v", envelope.Error)
 	}
-	if raw, err := second.Handle(pluginabi.MethodQuotaFetch, []byte(`{"provider":"ollama"}`)); err != nil {
+	if raw, err := second.Handle(pluginabi.MethodQuotaFetch, fetchRequest(t, "cred-1", "ollama")); err != nil {
 		t.Fatalf("fetch on the newest generation: %v", err)
 	} else if envelope := decodeEnvelope(t, raw); !envelope.OK {
 		t.Fatalf("the newest generation must still fetch after the first shutdown: %+v", envelope.Error)
@@ -283,7 +292,7 @@ func TestRuntimeShutdownAfterReplacementKeepsNewestServing(t *testing.T) {
 func TestRuntimeReinstallCycleKeepsServing(t *testing.T) {
 	runtime := NewRuntime()
 	for cycle := 1; cycle <= 3; cycle++ {
-		handler := runtime.Init()
+		handler := runtime.Init(nil)
 		raw, err := handler.Handle(pluginabi.MethodPluginRegister, registerPayload(t, enabledConfig))
 		if err != nil {
 			t.Fatalf("cycle %d register: %v", cycle, err)

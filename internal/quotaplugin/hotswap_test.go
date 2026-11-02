@@ -290,7 +290,7 @@ func TestRollbackRegisterAfterQuiesceServesAgain(t *testing.T) {
 	if envelope := decodeEnvelope(t, raw); !envelope.OK {
 		t.Fatalf("rollback register failed: %+v", envelope.Error)
 	}
-	fetched, err := h.Handle("quota.fetch", []byte(`{"provider":"ollama"}`))
+	fetched, err := h.Handle("quota.fetch", fetchRequest(t, "cred-1", "ollama"))
 	if err != nil {
 		t.Fatalf("fetch after rollback: %v", err)
 	}

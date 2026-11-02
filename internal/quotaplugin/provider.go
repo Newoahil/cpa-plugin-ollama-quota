@@ -2,62 +2,90 @@ package quotaplugin
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/LambdaTheory/cpa-plugin-ollama-quota/internal/ollama"
 )
 
-// drainTimeout bounds how long quiesce waits for tracked fetches to finish.
-//
-// A collection is itself bounded by the client's 20s timeout (SPEC 4.4), and
-// cancellation is cooperative, so normally this only has to cover the gap
-// between a cancelled fetch and its release. Five seconds is generous for that
-// while staying well inside any host-side unload timeout.
-//
-// Be honest about what the bound buys: it is NOT a proof that nothing can still
-// be running when quiesce returns. A fetch that ignores cancellation outlives
-// the wait, and the caller is told so through DrainReport (see quiesce).
 const drainTimeout = 5 * time.Second
 
-// DrainReport is the outcome of one bounded drain. It exists so a timeout is an
-// observable event rather than a swallowed boolean: the RPC layer turns TimedOut
-// into a distinguishable error envelope and a warning, and tests assert on it.
+// DrainReport combines tracked fetches and collector/callback obligations.
+// The counts are separate because one fetch can also own a host callback.
 type DrainReport struct {
-	// TimedOut reports that work tracked before CancelAll had not released when
-	// the bound expired. The host may still unload the library after this.
-	TimedOut bool
-	// InFlight is how many tracked fetches were still running when the bound
-	// expired. Zero when the drain completed.
-	InFlight int
-	// Timeout is the bound that was applied.
-	Timeout time.Duration
+	TimedOut    bool
+	InFlight    int
+	Timeout     time.Duration
+	HostPending int
+	Unsettled   bool
 }
 
-// Provider is the #1 placeholder implementation of pluginapi.QuotaProvider.
+func (r DrainReport) Error() string {
+	return fmt.Sprintf("drain incomplete: %d tracked fetch(es), %d callback/collector obligation(s), unsettled=%t", r.InFlight, r.HostPending, r.Unsettled)
+}
+
+func (r DrainReport) Unwrap() error { return ErrQuiesceIncomplete }
+
+// Provider is the pluginapi.QuotaProvider implementation for Ollama, in the
+// internal form this package uses so it can be tested without the SDK's wire
+// types. The RPC layer (rpc.go) is the only adapter between the two.
 //
-// It returns fixed sample data so the whole path — register, list, describe,
-// fetch, reset — can be exercised before #2 adds real collection. It never
-// reads credentials, so it cannot leak them.
+// A Provider never holds a credential. It is handed one per call, uses it for
+// the duration of one collection, and keeps only the resulting figures. That is
+// what makes it safe to keep a Provider alive across a quiesce while the host
+// swaps credentials underneath it.
 type Provider struct {
-	mu      sync.Mutex
+	// timeout bounds one collection (SPEC 4.4).
+	timeout time.Duration
+	// now is the clock, injected by tests.
+	now func() time.Time
+	// store keeps the last verified reading per credential.
+	store *store
+
+	mu sync.Mutex
+	// host is the callback bridge of the generation currently serving. It is
+	// replaced by every register, so a re-initialised generation never keeps
+	// using an older one.
+	host    *hostBridge
 	cancels map[uint64]context.CancelFunc
 	nextID  uint64
-	// inflight counts tracked work whose release has not run yet. Quiesce waits
-	// on it so a clean drain means nothing of ours is still running, not merely
-	// that the cancel signals were sent (SPEC 4.1). Add only happens under mu
-	// while cancels is non-nil, and CancelAll clears cancels under mu, so a wait
-	// started after CancelAll cannot race a late Add.
-	inflight sync.WaitGroup
-	// running mirrors inflight as a number, because a WaitGroup cannot report
-	// how much is left. It exists only so a timed-out drain can say how many
-	// fetches outlived the bound instead of failing silently.
 	running atomic.Int64
+	// idle allows bounded waits without leaking a waiter goroutine on retries.
+	idle chan struct{}
+}
+
+// ProviderOptions configures a Provider.
+type ProviderOptions struct {
+	// HostCall is the host callback bridge supplied by the cgo shim. It may be
+	// nil, in which case every collection fails with host_unavailable.
+	HostCall HostCall
+	// Timeout overrides the per-collection deadline. Zero keeps
+	// ollama.DefaultTimeout (20s).
+	Timeout time.Duration
+	// Now overrides the clock; only tests set it.
+	Now func() time.Time
 }
 
 // NewProvider returns a provider ready to serve; register re-arms it after a
 // quiesce.
-func NewProvider() *Provider {
-	return &Provider{cancels: make(map[uint64]context.CancelFunc)}
+func NewProvider(options ProviderOptions) *Provider {
+	timeout := options.Timeout
+	if timeout <= 0 {
+		timeout = ollama.DefaultTimeout
+	}
+	now := options.Now
+	if now == nil {
+		now = time.Now
+	}
+	return &Provider{
+		timeout: timeout,
+		now:     now,
+		store:   newStore(),
+		host:    newHostBridge(options.HostCall),
+		cancels: make(map[uint64]context.CancelFunc),
+	}
 }
 
 // ID returns the quota provider identifier, matching the host contract's
@@ -67,42 +95,15 @@ func (p *Provider) ID() string {
 }
 
 // Describe is the internal form of QuotaProvider.DescribeQuota.
+//
+// SupportsReset is false because Ollama has no endpoint that resets a window;
+// ResetQuota refuses rather than reporting a reset that did not happen.
 func (p *Provider) Describe() (displayName string, supported []string, supportsReset bool) {
 	return "Ollama", []string{QuotaIdentifier}, false
 }
 
-// Sample returns the fixed quota payload used until #2 replaces it with real
-// collection. Values are intentionally obvious placeholders: a window half
-// used and a $10.00 balance.
-func (p *Provider) Sample(providerKey string) (Sample, error) {
-	if providerKey != "" && providerKey != QuotaIdentifier {
-		return Sample{}, UnsupportedProviderError{Provider: providerKey}
-	}
-	return Sample{
-		Plan:              "Free",
-		TierName:          "Free",
-		TierID:            "free",
-		BalanceUSD:        10.00,
-		Window:            "5h",
-		RemainingFraction: 0.5,
-		WindowNote:        "sample data until #2 lands",
-	}, nil
-}
-
-// Sample is the placeholder payload; the RPC layer maps it to pluginapi types
-// so this package stays independent of the SDK's wire types.
-type Sample struct {
-	Plan              string
-	TierName          string
-	TierID            string
-	BalanceUSD        float64
-	Window            string
-	RemainingFraction float64
-	WindowNote        string
-}
-
-// Track registers a cancellable context so quiesce can abort in-flight
-// fetches. It reports false once CancelAll has run.
+// Track registers a cancellable context so quiesce can abort an in-flight fetch
+// and the collection it drives. It reports false once CancelAll has run.
 func (p *Provider) Track(ctx context.Context) (context.Context, func(), bool) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -116,22 +117,23 @@ func (p *Provider) Track(ctx context.Context) (context.Context, func(), bool) {
 	p.nextID++
 	id := p.nextID
 	p.cancels[id] = cancel
-	p.inflight.Add(1)
+	if p.running.Load() == 0 {
+		p.idle = make(chan struct{})
+	}
 	p.running.Add(1)
 	p.mu.Unlock()
 
+	var once sync.Once
 	release := func() {
-		p.mu.Lock()
-		entry, ok := p.cancels[id]
-		if ok {
+		once.Do(func() {
+			p.mu.Lock()
 			delete(p.cancels, id)
-		}
-		p.mu.Unlock()
-		if ok {
-			entry()
-		}
-		p.inflight.Done()
-		p.running.Add(-1)
+			cancel()
+			if p.running.Add(-1) == 0 {
+				close(p.idle)
+			}
+			p.mu.Unlock()
+		})
 	}
 	return trackedCtx, release, true
 }
@@ -148,33 +150,11 @@ func (p *Provider) CancelAll() {
 	}
 }
 
-// drain waits up to timeout for every tracked fetch to call its release, and
-// reports the outcome. A completed drain means no tracked fetch is still
-// running; a timed-out drain means some are, and the caller is expected to
-// surface that instead of pretending the barrier held.
-//
-// It must only be called after CancelAll: Add is only reachable under mu while
-// cancels is non-nil, and CancelAll clears cancels under mu, so no Add can
-// start after a drain begins.
-func (p *Provider) drain(timeout time.Duration) DrainReport {
-	done := make(chan struct{})
-	go func() {
-		p.inflight.Wait()
-		close(done)
-	}()
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case <-done:
-		return DrainReport{Timeout: timeout}
-	case <-timer.C:
-		// Read the counter rather than trusting the timer ordering: a fetch
-		// that released at almost the same instant still finished.
-		return DrainReport{TimedOut: true, InFlight: int(p.running.Load()), Timeout: timeout}
-	}
-}
-
 // Reset re-arms the provider after a hot reload registers it again.
+//
+// The cached readings survive a quiesce on purpose: they are the figures a
+// downgrade has to be able to show as stale, and dropping them would make the
+// page go blank for a reason unrelated to the credential.
 func (p *Provider) Reset() {
 	p.mu.Lock()
 	if p.cancels == nil {
@@ -182,3 +162,146 @@ func (p *Provider) Reset() {
 	}
 	p.mu.Unlock()
 }
+
+// drain waits for release, rather than treating cancellation as completion.
+// CancelAll must precede it. The channel also tolerates concurrent rollback:
+// unlike WaitGroup.Wait it cannot race a new Add after a zero count.
+func (p *Provider) drain(timeout time.Duration) DrainReport {
+	p.mu.Lock()
+	done := p.idle
+	if p.running.Load() == 0 {
+		p.mu.Unlock()
+		return DrainReport{Timeout: timeout}
+	}
+	p.mu.Unlock()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return DrainReport{Timeout: timeout}
+	case <-timer.C:
+		count := int(p.running.Load())
+		return DrainReport{TimedOut: count > 0, InFlight: count, Timeout: timeout}
+	}
+}
+
+// attemptTimeout is the budget for one whole collection attempt: the credential
+// read plus the Ollama HTTP request.
+//
+// SPEC 4.4's 20 seconds is the budget for 采集, which starts when the attempt
+// starts — at the credential — not when the first byte of HTTP goes out. A host
+// that blocks either half therefore cannot hold the collector (or quiesce) past
+// this.
+func (p *Provider) attemptTimeout() time.Duration {
+	if p.timeout <= 0 {
+		return ollama.DefaultTimeout
+	}
+	return p.timeout
+}
+
+// bridge returns the host callback bridge of the generation currently serving.
+func (p *Provider) bridge() *hostBridge {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.host
+}
+
+// setHostBridge installs the bridge for this generation. A nil or bridgeless
+// value still replaces the previous one, so a generation loaded without a host
+// cannot keep collecting through an earlier generation's bridge.
+func (p *Provider) setHostBridge(call HostCall) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.host = newHostBridge(call)
+}
+
+// startCollector starts this provider's background collector and returns the
+// function that stops it.
+//
+// The stop function does two things, and both are needed:
+//
+//  1. it cancels the collector's context and waits for the collector goroutine
+//     to exit, so no sweep keeps running after quiesce;
+//  2. it then waits on the bridge's in-flight set, which is what closes the
+//     P1-b gap: a context.AfterFunc cancel callback runs on a runtime goroutine
+//     that the collector goroutine does not wait for, and it can still be
+//     inside host.http.cancel when the collector returns.
+//
+// BOTH waits are bounded. A host call is a synchronous C function this plugin
+// cannot abandon, so an unbounded wait would wedge hot replacement on exactly
+// the broken host the bound is meant to survive.
+//
+// The bound expiring is a FAILURE, not a success: the returned drainOutcome
+// says so, and State.Quiesce turns it into a refused quiesce. Reporting
+// success (or only logging) while a host call is still live would tell the
+// host it may unload a library that still has work running in it.
+//
+// It must be called outside the state lock.
+func (p *Provider) startCollector(cfg Config) func() drainOutcome {
+	interval := time.Duration(cfg.IntervalSeconds) * time.Second
+	if interval <= 0 {
+		interval = defaultIntervalSeconds * time.Second
+	}
+	worker := &collector{
+		provider: p,
+		interval: interval,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		worker.run(ctx)
+	}()
+
+	// The bridge is read once here rather than inside stop: a register that
+	// replaced it would otherwise leave the old generation's calls unbarriered.
+	bridge := p.bridge()
+	waitBudget := p.attemptTimeout() + collectorBarrierGrace
+
+	return func() drainOutcome {
+		cancel()
+
+		// One deadline for the whole stop, so the two waits share a budget
+		// instead of each getting its own. The collector goroutine gets first
+		// claim on it because the in-flight set can only be read once it has
+		// stopped starting new calls.
+		deadline := time.Now().Add(waitBudget)
+
+		// done is closed by the collector goroutine itself, so the select can
+		// watch it directly. No waiter goroutine is needed, and a repeated
+		// stop (a retried quiesce) therefore costs nothing extra.
+		select {
+		case <-done:
+		case <-time.After(time.Until(deadline)):
+			// The collector goroutine is still parked in a host call. Report
+			// that rather than pretending the stop finished; the goroutine is
+			// left to unwind on its own so it cannot leak into the next
+			// generation. The in-flight set is not consulted here: the
+			// goroutine has not stopped starting calls yet, so its count is not
+			// a settled answer.
+			return drainOutcome{pending: 1}
+		}
+
+		// The collector goroutine is gone. That is necessary but not enough:
+		// a cancel callback it spawned can still be inside a host call, so the
+		// in-flight set decides. This is also what makes a retried stop
+		// meaningful -- on the second call the goroutine is usually already
+		// done, and the answer comes entirely from the in-flight set.
+		if bridge == nil {
+			return drainOutcome{drained: true}
+		}
+		barrier, cancelBarrier := context.WithDeadline(context.Background(), deadline)
+		defer cancelBarrier()
+		return bridge.waitInflight(barrier)
+	}
+}
+
+// collectorBarrierGrace is added to the attempt budget when waiting for
+// in-flight host calls to drain.
+//
+// A callback that is genuinely progressing can take a little longer than the
+// budget that bounded the work it is cleaning up — opening or closing an
+// operation is a separate round trip — so the barrier allows that. It stays
+// finite so a wedged host cannot make quiesce wait forever.
+const collectorBarrierGrace = 2 * time.Second

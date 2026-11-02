@@ -11,20 +11,32 @@ import (
 const enabledConfig = "enabled: true\n"
 const brokenConfig = "ignored: 1\ninterval_seconds: not-a-number\n"
 
-// newHandlerForTest returns a handler over a fresh state.
+// newHandlerForTest returns a handler over a fresh state with no host bridge.
+// It is for tests that never reach the network.
 func newHandlerForTest(t *testing.T) *Handler {
 	t.Helper()
 	return NewHandler(NewState())
 }
 
-// newRegisteredHandler returns a handler that has completed plugin.register,
-// which is the state every quota call arrives in.
+// newHandlerWithHost returns a handler whose collections and credential reads
+// go through the fixture host.
+func newHandlerWithHost(t *testing.T, host *fixtureHost) *Handler {
+	t.Helper()
+	return NewHandlerWithHost(NewStateFor(host.call), host.call)
+}
+
+// newRegisteredHandler returns a registered handler backed by a fixture host
+// with one credential and a successful balance answer.
 func newRegisteredHandler(t *testing.T) *Handler {
 	t.Helper()
-	h := newHandlerForTest(t)
+	host := newFixtureHost()
+	host.setCredential("cred-1", map[string]any{"type": "ollama", "api_key": "fixture-key"})
+	host.setRespond(balanceOK(balanceBody))
+	h := newHandlerWithHost(t, host)
 	if _, err := h.Handle(pluginabi.MethodPluginRegister, registerPayload(t, enabledConfig)); err != nil {
 		t.Fatalf("register: %v", err)
 	}
+	t.Cleanup(func() { h.state.Shutdown() })
 	return h
 }
 
@@ -35,6 +47,21 @@ func decodeEnvelope(t *testing.T, raw []byte) Envelope {
 		t.Fatalf("decode envelope: %v (body %s)", err, raw)
 	}
 	return envelope
+}
+
+// fetchRequest builds the quota.fetch payload the host sends: the SDK request
+// plus the host_callback_id the host adds.
+func fetchRequest(t *testing.T, authIndex, provider string) []byte {
+	t.Helper()
+	raw, errMarshal := json.Marshal(map[string]any{
+		"auth_index":       authIndex,
+		"provider":         provider,
+		"host_callback_id": "cb-1",
+	})
+	if errMarshal != nil {
+		t.Fatalf("marshal fetch request: %v", errMarshal)
+	}
+	return raw
 }
 
 func TestRegisterReportsQuotaCapability(t *testing.T) {
@@ -140,12 +167,101 @@ func TestQuotaDescribe(t *testing.T) {
 		t.Errorf("supported_providers = %v, want [ollama]", resp.SupportedProviders)
 	}
 	if resp.SupportsReset {
-		t.Error("supports_reset should be false until reset is implemented")
+		t.Error("supports_reset must be false: Ollama has no reset endpoint")
 	}
 }
 
-func TestQuotaFetchReturnsHalfUsedWindowAndTenDollarBalance(t *testing.T) {
-	raw, err := newRegisteredHandler(t).Handle(pluginabi.MethodQuotaFetch, []byte(`{"provider":"ollama"}`))
+// The mapping test: a real balance payload becomes the plan, one currency
+// metric, and one bucket per window, with RemainingFraction pointing the right
+// way. balanceBody says the 5h window is 30% used and the weekly window 80%
+// used, so the fractions are 0.7 and 0.2 — the reverse of the used shares.
+func TestQuotaFetchMapsBalanceAndWindows(t *testing.T) {
+	raw, err := newRegisteredHandler(t).Handle(pluginabi.MethodQuotaFetch, fetchRequest(t, "cred-1", "ollama"))
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	envelope := decodeEnvelope(t, raw)
+	if !envelope.OK {
+		t.Fatalf("fetch failed: %+v", envelope.Error)
+	}
+
+	var resp struct {
+		Subscription struct {
+			Plan string `json:"plan"`
+		} `json:"subscription"`
+		Summary []struct {
+			Key      string  `json:"key"`
+			Value    float64 `json:"value"`
+			Format   string  `json:"format"`
+			Currency string  `json:"currency"`
+		} `json:"summary"`
+		Groups []struct {
+			DisplayName string `json:"displayName"`
+			Buckets     []struct {
+				Window            string  `json:"window"`
+				RemainingFraction float64 `json:"remainingFraction"`
+				ResetTime         string  `json:"resetTime"`
+				Description       string  `json:"description"`
+			} `json:"buckets"`
+		} `json:"groups"`
+	}
+	if err := json.Unmarshal(envelope.Result, &resp); err != nil {
+		t.Fatalf("decode fetch: %v", err)
+	}
+
+	if resp.Subscription.Plan != "Pro" {
+		t.Errorf("plan = %q, want Pro", resp.Subscription.Plan)
+	}
+	if len(resp.Summary) != 1 {
+		t.Fatalf("summary = %+v, want one balance metric", resp.Summary)
+	}
+	if resp.Summary[0].Key != "balance" {
+		t.Errorf("summary key = %q, want balance", resp.Summary[0].Key)
+	}
+	if resp.Summary[0].Value != 12.40 {
+		t.Errorf("balance = %v, want 12.4", resp.Summary[0].Value)
+	}
+	if resp.Summary[0].Format != "currency" || resp.Summary[0].Currency != "USD" {
+		t.Errorf("balance format = %+v", resp.Summary[0])
+	}
+
+	if len(resp.Groups) != 1 || len(resp.Groups[0].Buckets) != 2 {
+		t.Fatalf("groups = %+v, want one group with two buckets", resp.Groups)
+	}
+	if resp.Groups[0].DisplayName != "Ollama" {
+		t.Errorf("group displayName = %q", resp.Groups[0].DisplayName)
+	}
+
+	byWindow := map[string]float64{}
+	for _, bucket := range resp.Groups[0].Buckets {
+		byWindow[bucket.Window] = bucket.RemainingFraction
+		if bucket.Description == "" {
+			t.Errorf("bucket %q has no description", bucket.Window)
+		}
+	}
+	// 30% used means 70% remaining.
+	if got := byWindow["5h"]; got != 0.7 {
+		t.Errorf("5h remainingFraction = %v, want 0.7 (30%% used, remaining not used)", got)
+	}
+	// 80% used means 20% remaining.
+	if got := byWindow["7d"]; got != 0.2 {
+		t.Errorf("7d remainingFraction = %v, want 0.2 (80%% used, remaining not used)", got)
+	}
+}
+
+// A credential that has been used up reports zero remaining, not a negative
+// fraction, and the balance metric still appears.
+func TestQuotaFetchClampsExhaustedWindow(t *testing.T) {
+	host := newFixtureHost()
+	host.setCredential("cred-1", map[string]any{"type": "ollama", "api_key": "fixture-key"})
+	host.setRespond(balanceOK(`{"plan":"free","included":{"session":{"remaining_percent":0,"resets_at":"2026-10-30T20:00:00Z"}}}`))
+	h := newHandlerWithHost(t, host)
+	if _, err := h.Handle(pluginabi.MethodPluginRegister, registerPayload(t, enabledConfig)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	t.Cleanup(func() { h.state.Shutdown() })
+
+	raw, err := h.Handle(pluginabi.MethodQuotaFetch, fetchRequest(t, "cred-1", "ollama"))
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
@@ -154,12 +270,6 @@ func TestQuotaFetchReturnsHalfUsedWindowAndTenDollarBalance(t *testing.T) {
 		t.Fatalf("fetch failed: %+v", envelope.Error)
 	}
 	var resp struct {
-		Summary []struct {
-			Key      string  `json:"key"`
-			Value    float64 `json:"value"`
-			Format   string  `json:"format"`
-			Currency string  `json:"currency"`
-		} `json:"summary"`
 		Groups []struct {
 			Buckets []struct {
 				RemainingFraction float64 `json:"remainingFraction"`
@@ -167,33 +277,54 @@ func TestQuotaFetchReturnsHalfUsedWindowAndTenDollarBalance(t *testing.T) {
 		} `json:"groups"`
 	}
 	if err := json.Unmarshal(envelope.Result, &resp); err != nil {
-		t.Fatalf("decode fetch: %v", err)
-	}
-	if len(resp.Summary) != 1 || resp.Summary[0].Value != 10.00 {
-		t.Fatalf("summary = %+v, want one $10.00 balance", resp.Summary)
-	}
-	if resp.Summary[0].Format != "currency" || resp.Summary[0].Currency != "USD" {
-		t.Errorf("balance format = %+v", resp.Summary[0])
+		t.Fatalf("decode: %v", err)
 	}
 	if len(resp.Groups) != 1 || len(resp.Groups[0].Buckets) != 1 {
-		t.Fatalf("groups = %+v, want one group with one bucket", resp.Groups)
+		t.Fatalf("groups = %+v", resp.Groups)
 	}
-	if got := resp.Groups[0].Buckets[0].RemainingFraction; got != 0.5 {
-		t.Errorf("remainingFraction = %v, want 0.5 (50%% used)", got)
+	if got := resp.Groups[0].Buckets[0].RemainingFraction; got != 0 {
+		t.Errorf("remainingFraction = %v, want 0", got)
 	}
 }
 
 func TestQuotaFetchRejectsForeignProvider(t *testing.T) {
-	raw, err := newRegisteredHandler(t).Handle(pluginabi.MethodQuotaFetch, []byte(`{"provider":"anthropic"}`))
+	raw, err := newRegisteredHandler(t).Handle(pluginabi.MethodQuotaFetch, fetchRequest(t, "cred-1", "anthropic"))
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
 	envelope := decodeEnvelope(t, raw)
 	if envelope.OK {
-		t.Fatal("a foreign provider must not receive sample numbers")
+		t.Fatal("a foreign provider must not receive Ollama figures")
 	}
 	if envelope.Error.Code != "unsupported_provider" {
 		t.Errorf("error code = %q, want unsupported_provider", envelope.Error.Code)
+	}
+}
+
+// A credential with neither an API key nor a cookie must fail before any
+// request is issued.
+func TestQuotaFetchIncompleteCredentialSendsNothing(t *testing.T) {
+	host := newFixtureHost()
+	host.setCredential("cred-1", map[string]any{"type": "ollama", "email": "a@example.com"})
+	h := newHandlerWithHost(t, host)
+	if _, err := h.Handle(pluginabi.MethodPluginRegister, registerPayload(t, enabledConfig)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	t.Cleanup(func() { h.state.Shutdown() })
+
+	raw, err := h.Handle(pluginabi.MethodQuotaFetch, fetchRequest(t, "cred-1", "ollama"))
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	envelope := decodeEnvelope(t, raw)
+	if envelope.OK {
+		t.Fatal("an incomplete credential must not produce a figure")
+	}
+	if envelope.Error.Code != "credential_incomplete" {
+		t.Errorf("error code = %q, want credential_incomplete", envelope.Error.Code)
+	}
+	if count := host.requestCount(); count != 0 {
+		t.Errorf("issued %d upstream request(s) for an incomplete credential, want 0", count)
 	}
 }
 
@@ -218,5 +349,28 @@ func TestQuotaResetIsUnsupported(t *testing.T) {
 	}
 	if !strings.Contains(resp.Message, "not supported") {
 		t.Errorf("message = %q", resp.Message)
+	}
+}
+
+// The credential never reaches the response, in any field, on any path.
+func TestQuotaFetchDoesNotEchoCredential(t *testing.T) {
+	const canary = "fixture-api-key-canary-value"
+	host := newFixtureHost()
+	host.setCredential("cred-1", map[string]any{"type": "ollama", "api_key": canary})
+	// An upstream that happily repeats whatever it is given back in the plan
+	// field — the case #2's rejectEcho guards against.
+	host.setRespond(balanceOK(`{"plan":"` + canary + `","included":{"balance_usd":1}}`))
+	h := newHandlerWithHost(t, host)
+	if _, err := h.Handle(pluginabi.MethodPluginRegister, registerPayload(t, enabledConfig)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	t.Cleanup(func() { h.state.Shutdown() })
+
+	raw, err := h.Handle(pluginabi.MethodQuotaFetch, fetchRequest(t, "cred-1", "ollama"))
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if strings.Contains(string(raw), canary) {
+		t.Fatalf("the fetch response echoes the credential: %s", raw)
 	}
 }
