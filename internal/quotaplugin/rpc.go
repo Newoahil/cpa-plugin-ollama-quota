@@ -6,12 +6,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/LambdaTheory/cpa-plugin-ollama-quota/internal/ollama"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
+
+const DrainTimeoutCode = "quiesce_drain_timeout"
+
+type LifecycleResponse struct{}
 
 // Envelope is the RPC frame the host decodes for every plugin call.
 type Envelope struct {
@@ -23,9 +28,10 @@ type Envelope struct {
 // EnvelopeError reports a failed call. Message must never contain credential
 // material.
 type EnvelopeError struct {
-	Code      string `json:"code"`
-	Message   string `json:"message"`
-	Retryable bool   `json:"retryable,omitempty"`
+	Code      string         `json:"code"`
+	Message   string         `json:"message"`
+	Retryable bool           `json:"retryable,omitempty"`
+	Detail    map[string]any `json:"detail,omitempty"`
 }
 
 // IdentifierResponse is the shape the host decodes for *.identifier methods.
@@ -111,19 +117,10 @@ func (h *Handler) Handle(method string, request []byte) ([]byte, error) {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
 		return h.handleRegister(request)
 	case pluginabi.MethodPluginQuiesce:
-		// A quiesce that could not drain reports a failure. The host reads
-		// this before it swaps or unloads: an OK envelope would tell it the
-		// library has no live call in it, which is exactly what the drain
-		// budget just disproved.
-		if _, errQuiesce := h.state.Quiesce(); errQuiesce != nil {
-			return ErrorEnvelope("quiesce_incomplete", errQuiesce.Error()), nil
-		}
-		return OKEnvelope(struct{}{})
+		_, errDrain := h.state.Quiesce()
+		return h.lifecycleEnvelope(errDrain)
 	case pluginabi.MethodPluginShutdown:
-		if errShutdown := h.state.Shutdown(); errShutdown != nil {
-			return ErrorEnvelope("shutdown_incomplete", errShutdown.Error()), nil
-		}
-		return OKEnvelope(struct{}{})
+		return h.lifecycleEnvelope(h.state.Shutdown())
 	case pluginabi.MethodQuotaIdentifier:
 		return OKEnvelope(IdentifierResponse{Identifier: QuotaIdentifier})
 	case pluginabi.MethodQuotaDescribe:
@@ -137,6 +134,29 @@ func (h *Handler) Handle(method string, request []byte) ([]byte, error) {
 		// "not supported", so anything outside this surface reports that way.
 		return ErrorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
+}
+
+// lifecycleEnvelope reports one combined drain result. CPA v8.0.47 callQuiesce
+// discards the bool: this honestly reports failure, but cannot prevent unload.
+// Use this call's error, since another lifecycle call can overwrite LastDrain.
+func (h *Handler) lifecycleEnvelope(err error) ([]byte, error) {
+	if err == nil {
+		return OKEnvelope(LifecycleResponse{})
+	}
+	var report DrainReport
+	if !errors.As(err, &report) {
+		report.TimedOut = true
+	}
+	return json.Marshal(Envelope{Error: &EnvelopeError{
+		Code:    DrainTimeoutCode,
+		Message: fmt.Sprintf("%s; tracked wait budget %s", report.Error(), report.Timeout),
+		Detail: map[string]any{
+			"in_flight":    report.InFlight,
+			"timeout_s":    report.Timeout.Seconds(),
+			"host_pending": report.HostPending,
+			"unsettled":    report.Unsettled,
+		},
+	}})
 }
 
 func (h *Handler) handleRegister(raw []byte) ([]byte, error) {

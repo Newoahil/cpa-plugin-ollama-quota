@@ -56,7 +56,7 @@ func TestQuiesceAfterFailedShutdownStillFails(t *testing.T) {
 	if shutdownEnvelope.OK {
 		t.Fatal("shutdown reported success while a host callback was live")
 	}
-	if shutdownEnvelope.Error == nil || shutdownEnvelope.Error.Code != "shutdown_incomplete" {
+	if shutdownEnvelope.Error == nil || shutdownEnvelope.Error.Code != DrainTimeoutCode {
 		t.Fatalf("shutdown error = %+v, want shutdown_incomplete", shutdownEnvelope.Error)
 	}
 
@@ -66,7 +66,7 @@ func TestQuiesceAfterFailedShutdownStillFails(t *testing.T) {
 	if quiesceEnvelope.OK {
 		t.Fatal("quiesce reported success after a failed shutdown while the callback was still running")
 	}
-	if quiesceEnvelope.Error == nil || quiesceEnvelope.Error.Code != "quiesce_incomplete" {
+	if quiesceEnvelope.Error == nil || quiesceEnvelope.Error.Code != DrainTimeoutCode {
 		t.Fatalf("quiesce error = %+v, want quiesce_incomplete", quiesceEnvelope.Error)
 	}
 
@@ -93,7 +93,7 @@ func TestShutdownAfterFailedQuiesceStillFails(t *testing.T) {
 	if quiesceEnvelope.OK {
 		t.Fatal("quiesce reported success while a host callback was live")
 	}
-	if quiesceEnvelope.Error == nil || quiesceEnvelope.Error.Code != "quiesce_incomplete" {
+	if quiesceEnvelope.Error == nil || quiesceEnvelope.Error.Code != DrainTimeoutCode {
 		t.Fatalf("quiesce error = %+v, want quiesce_incomplete", quiesceEnvelope.Error)
 	}
 

@@ -55,7 +55,7 @@ func TestRepeatedQuiesceKeepsFailingUntilTheCallbackExits(t *testing.T) {
 	if first.OK {
 		t.Fatal("first quiesce reported success while a host callback was live")
 	}
-	if first.Error == nil || first.Error.Code != "quiesce_incomplete" {
+	if first.Error == nil || first.Error.Code != DrainTimeoutCode {
 		t.Fatalf("first quiesce error = %+v, want quiesce_incomplete", first.Error)
 	}
 	afterFirst := state.DrainAttempts()
@@ -69,7 +69,7 @@ func TestRepeatedQuiesceKeepsFailingUntilTheCallbackExits(t *testing.T) {
 	if second.OK {
 		t.Fatal("second quiesce reported success while the same callback was still running")
 	}
-	if second.Error == nil || second.Error.Code != "quiesce_incomplete" {
+	if second.Error == nil || second.Error.Code != DrainTimeoutCode {
 		t.Fatalf("second quiesce error = %+v, want quiesce_incomplete", second.Error)
 	}
 	if got := state.DrainAttempts(); got <= afterFirst {
@@ -144,7 +144,7 @@ func TestRepeatedShutdownKeepsFailingUntilTheCallbackExits(t *testing.T) {
 	if second.OK {
 		t.Fatal("second shutdown reported success while the same callback was still running")
 	}
-	if second.Error == nil || second.Error.Code != "shutdown_incomplete" {
+	if second.Error == nil || second.Error.Code != DrainTimeoutCode {
 		t.Fatalf("second shutdown error = %+v, want shutdown_incomplete", second.Error)
 	}
 

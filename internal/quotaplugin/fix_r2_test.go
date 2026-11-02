@@ -113,7 +113,7 @@ func TestQuiesceReportsIncompleteDrainAtRPC(t *testing.T) {
 		releaseCancel()
 		t.Fatal("quiesce reported success while the drain budget had expired with a host call still live")
 	}
-	if envelope.Error == nil || envelope.Error.Code != "quiesce_incomplete" {
+	if envelope.Error == nil || envelope.Error.Code != DrainTimeoutCode {
 		releaseCancel()
 		t.Fatalf("error = %+v, want the quiesce_incomplete code", envelope.Error)
 	}

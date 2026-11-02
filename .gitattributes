@@ -1,0 +1,12 @@
+# Shell scripts and fixtures are executed as-is; CRLF breaks heredocs and
+# shebangs in Git Bash and on Linux.
+*.sh           text eol=lf
+*.py           text eol=lf
+*.go           text eol=lf
+*.md           text eol=lf
+*.yaml         text eol=lf
+*.yml          text eol=lf
+*.go.mod       text eol=lf
+go.mod         text eol=lf
+go.sum         text eol=lf
+Dockerfile     text eol=lf

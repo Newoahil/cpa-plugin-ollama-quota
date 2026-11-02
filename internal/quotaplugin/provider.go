@@ -2,11 +2,31 @@ package quotaplugin
 
 import (
 	"context"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/LambdaTheory/cpa-plugin-ollama-quota/internal/ollama"
 )
+
+const drainTimeout = 5 * time.Second
+
+// DrainReport combines tracked fetches and collector/callback obligations.
+// The counts are separate because one fetch can also own a host callback.
+type DrainReport struct {
+	TimedOut    bool
+	InFlight    int
+	Timeout     time.Duration
+	HostPending int
+	Unsettled   bool
+}
+
+func (r DrainReport) Error() string {
+	return fmt.Sprintf("drain incomplete: %d tracked fetch(es), %d callback/collector obligation(s), unsettled=%t", r.InFlight, r.HostPending, r.Unsettled)
+}
+
+func (r DrainReport) Unwrap() error { return ErrQuiesceIncomplete }
 
 // Provider is the pluginapi.QuotaProvider implementation for Ollama, in the
 // internal form this package uses so it can be tested without the SDK's wire
@@ -28,9 +48,13 @@ type Provider struct {
 	// host is the callback bridge of the generation currently serving. It is
 	// replaced by every register, so a re-initialised generation never keeps
 	// using an older one.
-	host    *hostBridge
-	cancels map[uint64]context.CancelFunc
-	nextID  uint64
+	host     *hostBridge
+	cancels  map[uint64]context.CancelFunc
+	nextID   uint64
+	inflight sync.WaitGroup
+	running  atomic.Int64
+	// idle allows bounded waits without leaking a waiter goroutine on retries.
+	idle chan struct{}
 }
 
 // ProviderOptions configures a Provider.
@@ -94,15 +118,25 @@ func (p *Provider) Track(ctx context.Context) (context.Context, func(), bool) {
 	p.nextID++
 	id := p.nextID
 	p.cancels[id] = cancel
+	if p.running.Load() == 0 {
+		p.idle = make(chan struct{})
+	}
+	p.inflight.Add(1)
+	p.running.Add(1)
 	p.mu.Unlock()
 
+	var once sync.Once
 	release := func() {
-		p.mu.Lock()
-		if entry, ok := p.cancels[id]; ok {
+		once.Do(func() {
+			p.mu.Lock()
 			delete(p.cancels, id)
-			entry()
-		}
-		p.mu.Unlock()
+			cancel()
+			p.inflight.Done()
+			if p.running.Add(-1) == 0 {
+				close(p.idle)
+			}
+			p.mu.Unlock()
+		})
 	}
 	return trackedCtx, release, true
 }
@@ -130,6 +164,28 @@ func (p *Provider) Reset() {
 		p.cancels = make(map[uint64]context.CancelFunc)
 	}
 	p.mu.Unlock()
+}
+
+// drain waits for release, rather than treating cancellation as completion.
+// CancelAll must precede it. The channel also tolerates concurrent rollback:
+// unlike WaitGroup.Wait it cannot race a new Add after a zero count.
+func (p *Provider) drain(timeout time.Duration) DrainReport {
+	p.mu.Lock()
+	done := p.idle
+	if p.running.Load() == 0 {
+		p.mu.Unlock()
+		return DrainReport{Timeout: timeout}
+	}
+	p.mu.Unlock()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return DrainReport{Timeout: timeout}
+	case <-timer.C:
+		count := int(p.running.Load())
+		return DrainReport{TimedOut: count > 0, InFlight: count, Timeout: timeout}
+	}
 }
 
 // attemptTimeout is the budget for one whole collection attempt: the credential

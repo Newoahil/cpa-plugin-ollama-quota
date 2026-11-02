@@ -1,8 +1,10 @@
 package quotaplugin
 
 import (
+	"context"
 	"errors"
 	"sync"
+	"time"
 )
 
 // Phase is the plugin instance lifecycle state.
@@ -93,6 +95,7 @@ type State struct {
 	// drainAttempts counts bounded drain judgements, so a caller (and a test)
 	// can tell a real re-check apart from an early return.
 	drainAttempts uint64
+	lastDrain     DrainReport
 	// orphanDrains holds every collector this instance detached from the live
 	// slot, or refused one, whose stop has not been confirmed drained.
 	//
@@ -275,17 +278,12 @@ func (s *State) Register(configYAML []byte) (Config, error) {
 	return cfg, errConfig
 }
 
-// Quiesce refuses new work, cancels in-flight fetches, and drains the host
-// calls the collector started.
-//
-// A successful quiesce means every host call this plugin started has
-// returned, so the library is safe to unload. That is a BOUNDED guarantee:
-// the drain waits at most the attempt budget plus a small margin, because a
-// host that ignores the cancel cannot be abandoned from inside the plugin.
-// When the bound expires Quiesce reports ErrQuiesceIncomplete and the RPC
-// layer refuses the call, which is what tells the host there is no safe
-// unload condition right now. Reporting success while a callback still runs
-// would be worse than a longer wait: the host would swap a live library.
+// Quiesce refuses new work, cancels fetches, and judges tracked fetches plus
+// live/detached collector and callback work in one result. Every stop keeps
+// its bounded attempt budget plus grace; tracked work gets a 5s release wait.
+// A failure is reported through ErrQuiesceIncomplete, LastDrain and the RPC
+// envelope. CPA v8.0.47 ignores the quiesce bool, so reporting failure cannot
+// itself stop that host from unloading a library with unconfirmed work.
 //
 // It returns the phase it was in before the call, plus the drain error.
 //
@@ -423,7 +421,37 @@ func (s *State) drain(live *drainEntry, pending []*drainEntry) error {
 	s.drainAttempts++
 	s.mu.Unlock()
 
-	return s.drainEntries(append([]*drainEntry{live}, pending...))
+	deadline := time.Now().Add(drainTimeout)
+	// Keep one judgement for every live/detached stop, including unsettled
+	// stops. Cancellation alone is never evidence that either work set exited.
+	errEntries := s.drainEntries(append([]*drainEntry{live}, pending...))
+	report := s.provider.drain(drainTimeout)
+	var entryReport DrainReport
+	if errors.As(errEntries, &entryReport) {
+		report.HostPending = entryReport.HostPending
+		report.Unsettled = entryReport.Unsettled
+	}
+	// On-demand fetches can leave host callbacks running after release even
+	// without a collector. Old bridges remain owned by their drain entries.
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	outcome := s.provider.bridge().waitInflight(ctx)
+	cancel()
+	var errBridge error
+	if !outcome.drained {
+		errBridge = outcome.errDrainTimeout()
+		// The live collector may already have counted this bridge.
+		if outcome.pending > report.HostPending {
+			report.HostPending = outcome.pending
+		}
+	}
+	report.TimedOut = report.TimedOut || errEntries != nil || errBridge != nil
+	s.mu.Lock()
+	s.lastDrain = report
+	s.mu.Unlock()
+	if !report.TimedOut {
+		return nil
+	}
+	return errors.Join(report, errEntries, errBridge)
 }
 
 // drainEntries judges each entry once, reclaims the ones it confirmed drained,
@@ -435,6 +463,7 @@ func (s *State) drain(live *drainEntry, pending []*drainEntry) error {
 // reported "not drained" must stay so the next call re-judges it.
 func (s *State) drainEntries(entries []*drainEntry) error {
 	var failures []error
+	var report DrainReport
 	var confirmed []*drainEntry
 	for _, entry := range entries {
 		if entry == nil {
@@ -446,11 +475,24 @@ func (s *State) drainEntries(entries []*drainEntry) error {
 			continue
 		}
 		failures = append(failures, outcome.errDrainTimeout())
+		report.HostPending += outcome.pending
+		report.Unsettled = report.Unsettled || outcome.unsettled
 	}
 	if len(confirmed) > 0 {
 		s.reclaim(confirmed...)
 	}
-	return errors.Join(failures...)
+	if len(failures) == 0 {
+		return nil
+	}
+	report.TimedOut = true
+	return errors.Join(append([]error{report}, failures...)...)
+}
+
+// LastDrain exposes the same combined judgement returned by Quiesce/Shutdown.
+func (s *State) LastDrain() DrainReport {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastDrain
 }
 
 // reclaim removes entries a drain confirmed drained from the pending list.
