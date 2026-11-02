@@ -48,11 +48,10 @@ type Provider struct {
 	// host is the callback bridge of the generation currently serving. It is
 	// replaced by every register, so a re-initialised generation never keeps
 	// using an older one.
-	host     *hostBridge
-	cancels  map[uint64]context.CancelFunc
-	nextID   uint64
-	inflight sync.WaitGroup
-	running  atomic.Int64
+	host    *hostBridge
+	cancels map[uint64]context.CancelFunc
+	nextID  uint64
+	running atomic.Int64
 	// idle allows bounded waits without leaking a waiter goroutine on retries.
 	idle chan struct{}
 }
@@ -121,7 +120,6 @@ func (p *Provider) Track(ctx context.Context) (context.Context, func(), bool) {
 	if p.running.Load() == 0 {
 		p.idle = make(chan struct{})
 	}
-	p.inflight.Add(1)
 	p.running.Add(1)
 	p.mu.Unlock()
 
@@ -131,7 +129,6 @@ func (p *Provider) Track(ctx context.Context) (context.Context, func(), bool) {
 			p.mu.Lock()
 			delete(p.cancels, id)
 			cancel()
-			p.inflight.Done()
 			if p.running.Add(-1) == 0 {
 				close(p.idle)
 			}

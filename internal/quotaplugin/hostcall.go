@@ -258,6 +258,13 @@ func (b *hostBridge) waitInflight(ctx context.Context) drainOutcome {
 	}
 	b.drainChecks.Add(1)
 	idle := b.inflight.freeze()
+	// An already idle set has drained even when the deadline has expired.
+	// Prefer that evidence over a random choice between two ready cases.
+	select {
+	case <-idle:
+		return drainOutcome{drained: true}
+	default:
+	}
 	select {
 	case <-idle:
 		return drainOutcome{drained: true}

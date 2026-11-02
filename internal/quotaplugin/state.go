@@ -414,14 +414,15 @@ func (s *State) publishPendingLocked(entry *drainEntry) {
 // report success when EVERY stop this instance ever installed agrees nothing
 // is running.
 //
-// The wait stays bounded by each stop's own budget, so a host that never
-// returns still results in a clear failure rather than a wedged hot replace.
+// The serial upper bound is the sum of each stop's budget, plus 5s for tracked
+// fetches, plus an independent 5s for the current bridge. With one default
+// collector this is 22s + 5s + 5s; detached collectors add their own budgets.
+// A host that never returns therefore reports failure within a finite wait.
 func (s *State) drain(live *drainEntry, pending []*drainEntry) error {
 	s.mu.Lock()
 	s.drainAttempts++
 	s.mu.Unlock()
 
-	deadline := time.Now().Add(drainTimeout)
 	// Keep one judgement for every live/detached stop, including unsettled
 	// stops. Cancellation alone is never evidence that either work set exited.
 	errEntries := s.drainEntries(append([]*drainEntry{live}, pending...))
@@ -433,13 +434,15 @@ func (s *State) drain(live *drainEntry, pending []*drainEntry) error {
 	}
 	// On-demand fetches can leave host callbacks running after release even
 	// without a collector. Old bridges remain owned by their drain entries.
-	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	bridgeDeadline := time.Now().Add(drainTimeout)
+	ctx, cancel := context.WithDeadline(context.Background(), bridgeDeadline)
 	outcome := s.provider.bridge().waitInflight(ctx)
 	cancel()
 	var errBridge error
 	if !outcome.drained {
 		errBridge = outcome.errDrainTimeout()
-		// The live collector may already have counted this bridge.
+		// HostPending is max(sum of stop obligations, current bridge pending),
+		// not a distinct-callback total: the live stop may count this bridge too.
 		if outcome.pending > report.HostPending {
 			report.HostPending = outcome.pending
 		}

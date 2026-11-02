@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 )
 
 // Release the two independent work sets in either order. Neither release may
@@ -55,6 +57,67 @@ func TestQuiesceWaitsForBothWorkSets(t *testing.T) {
 				t.Fatal("clean drain reported timeout")
 			}
 		})
+	}
+}
+
+func TestQuiesceSlowStopIdleBridgeSucceeds(t *testing.T) {
+	s := newStateWithoutCollector(nil)
+	_, _ = s.Register(nil)
+	s.SetCollector(func() drainOutcome {
+		time.Sleep(drainTimeout + 300*time.Millisecond)
+		return drainOutcome{drained: true}
+	})
+	if _, err := s.Quiesce(); err != nil {
+		t.Fatalf("clean slow stop must succeed: %v", err)
+	}
+	if s.LastDrain().TimedOut {
+		t.Fatal("clean slow stop recorded a timeout")
+	}
+}
+
+// A real fixture cancel callback outlives the clean collector stop. Its own
+// bridge budget must still run, and a callback held past that budget must fail.
+func TestQuiesceSlowStopHeldBridgeFails(t *testing.T) {
+	host := newFixtureHost()
+	entered, release, _ := host.setCancelHold()
+	s := newStateWithoutCollector(host.call)
+	_, _ = s.Register(nil)
+	callbackDone := make(chan error, 1)
+	go func() {
+		callbackDone <- s.provider.bridge().invoke(context.Background(), pluginabi.MethodHostHTTPCancel, map[string]any{}, nil)
+	}()
+	t.Cleanup(func() { release(); <-callbackDone })
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("fixture cancel callback did not enter")
+	}
+	s.SetCollector(func() drainOutcome {
+		time.Sleep(drainTimeout + 300*time.Millisecond)
+		return drainOutcome{drained: true}
+	})
+	started := time.Now()
+	_, err := s.Quiesce()
+	if err == nil {
+		t.Fatal("held callback must fail quiesce")
+	}
+	report := s.LastDrain()
+	if !report.TimedOut || report.HostPending != 1 {
+		t.Fatalf("expected one held callback: %+v, %v", report, err)
+	}
+	if time.Since(started) < 2*drainTimeout+300*time.Millisecond {
+		t.Fatal("bridge did not receive its independent full budget")
+	}
+}
+
+func TestWaitInflightExpiredDeadlineIdleIsDrained(t *testing.T) {
+	bridge := newHostBridge(nil)
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	for i := 0; i < 400; i++ {
+		if outcome := bridge.waitInflight(ctx); !outcome.drained {
+			t.Fatalf("idle bridge failed at attempt %d: %+v", i, outcome)
+		}
 	}
 }
 
