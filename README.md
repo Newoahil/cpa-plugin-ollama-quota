@@ -120,7 +120,8 @@ scripts/build.sh --go               # 用本机的 Go 和 C 工具链编译当�
 
    v8.0.47 没有 `PATCH /v0/management/config`（实测 404），v0 的配置入口只有
    `GET /config` 和 `GET/PUT /config.yaml`。备选是直接编辑 `config.yaml`，由 watcher
-   捕获并应用；Docker Desktop 的宿主 bind mount 写入可能不产生容器内 inotify 事件，
+   捕获并应用（实测的是容器内 `cat` 原位覆盖；**宿主侧编辑 bind mount 文件未验证**，
+   可能不触发容器内 watcher）。
    优先使用管理接口。请确认加载日志、注册接口及 **进程 PID 不变、没有重启**，
    详见[首次安装实测](docs/hotswap-verification.md#首次安装从未启用插件子系统到插件生效)。
    运行中的日志里应该出现：

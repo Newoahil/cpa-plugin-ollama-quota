@@ -14,7 +14,9 @@ CPA 进程 PID、容器 `StartedAt`、`RestartCount` 三项全程不变，替换
 没有 `error` / `fatal` / `panic`，也没有 quiesce drain 超时。
 
 **但 SPEC 4.1 的「等手上的采集中止」只有部分验证，不能整体标为满足。**
-合作取消路径已验证；不理会取消的采集中止不了，5 秒后放弃并把超时**记录/上报**出来，
+合作取消路径已验证；不理会取消的采集中止不了。tracked fetch 的等待预算是 5 秒，
+当前 quiesce 的总上界在单个默认 collector 下约 32 秒（见下文「当前 drain 上限」）；
+超时会被**记录/上报**出来，
 宿主仍会卸载插件（改这一点需要改 CPA，另立票）。逐条见「quiesce 与 SPEC 4.1 的差距」。
 
 ## 这是独立的测试实例 + fixture 环境
@@ -441,8 +443,9 @@ PASS  first install verified: a 40s request (measured) crossed first enable inta
 
 备选文件路径也单独实测通过：04:20:21—04:21:01 的 40 秒流跨过容器内
 原位编辑配置与 watcher 加载（04:20:31），40/40 token 全到，PID 全程 878549，
-StartedAt 和 RestartCount 不变。Docker Desktop 的宿主 bind mount 写入不保证 inotify，
-因此该次是在隔离容器内生成临时内容再 `cat` 原位覆盖；单文件挂载不能用 `sed -i` 重命名。
+StartedAt 和 RestartCount 不变。该次实测是在隔离容器内生成临时内容再 `cat` 原位覆盖；
+**宿主侧编辑 bind mount 文件未验证**，可能不触发容器内 watcher。
+单文件挂载不能用 `sed -i` 重命名。
 优先使用上面已经跑通的 v8 管理接口。
 
 复跑：`bash scripts/verify-first-install.sh`。端口变量是 `FIRST_INSTALL_PORT`、
