@@ -14,7 +14,9 @@ CPA 进程 PID、容器 `StartedAt`、`RestartCount` 三项全程不变，替换
 没有 `error` / `fatal` / `panic`，也没有 quiesce drain 超时。
 
 **但 SPEC 4.1 的「等手上的采集中止」只有部分验证，不能整体标为满足。**
-合作取消路径已验证；不理会取消的采集中止不了，5 秒后放弃并把超时**记录/上报**出来，
+合作取消路径已验证；不理会取消的采集中止不了。tracked fetch 的等待预算是 5 秒，
+当前 quiesce 的总上界在单个默认 collector 下约 32 秒（见下文「当前 drain 上限」）；
+超时会被**记录/上报**出来，
 宿主仍会卸载插件（改这一点需要改 CPA，另立票）。逐条见「quiesce 与 SPEC 4.1 的差距」。
 
 ## 这是独立的测试实例 + fixture 环境
@@ -240,7 +242,7 @@ SPEC 4.1 要求：收到 quiesce 后**拒绝新请求、等手上的采集中止
 - **已验证**：一个遵守取消的采集，在 `Quiesce` 返回前一定已经跑完 `release`。
   `TestQuiesceWaitsForInFlightFetch` 直接断言这一点，`TestCleanQuiesceEnvelopeIsSuccess`
   断言这种情况下 RPC 回的是普通成功。
-- **未证明**：一个**不理会**取消的采集。`drain` 5 秒后放弃，此时
+- **未证明**：一个**不理会**取消的采集。该 tracked fetch 测试的等待预算为 5 秒，此时
   `TestQuiesceTimeoutIsObservable` / `TestQuiesceTimeoutSurfacesAsErrorEnvelope`
   断言超时被**观察到**：`State.LastDrain()` 记录 `TimedOut=true, InFlight=N`，
   RPC 返回 `ok:false` + code `quiesce_drain_timeout` + `detail.in_flight`。
@@ -250,12 +252,15 @@ SPEC 4.1 要求：收到 quiesce 后**拒绝新请求、等手上的采集中止
 
 要让宿主在有在途采集时拒绝替换，必须改 CPA（本票硬边界之外），另立票。
 
-### 为什么 drain 上限是 5 秒
+### 当前 drain 上限（合并后更正）
 
-一次采集本身被 `ollama.DefaultTimeout`（20 秒）兜住，取消是协作式的，所以正常情况下
-从「发取消」到「release 跑完」只差一个收尾的距离；5 秒明显大于正常收尾所需，又远小于
-任何宿主侧的卸载超时。**这个上限不是屏障证明**，它只是把「永久卡住」换成「有界等待 +
-可观察的未完成」。超时后 quiesce 照常返回是刻意的：卡死比「已知未完成」更糟。
+当前 `State.drain` 串行判定三组工作：collector stops、`Provider.Track` 取数、
+宿主回调。最坏等待上界约「各 collector stop 预算之和 + 5 秒 + 5 秒」，
+单个默认 collector 是 22 + 5 + 5，约 32 秒；脱离的 collector 还会增加各自的 stop 预算。
+**正常情况远小于这个值**，工作完成就继续，没有工作时不会等满预算。
+超时统一返回 `quiesce_drain_timeout`，带 `detail.in_flight`、`detail.host_pending`、
+`detail.unsettled`；这个有界等待不是所有回调都结束的无条件屏障。
+前面 2026-10-30 的 5 秒超时案例只描述当时的 tracked fetch 测试，不能当作当前 quiesce 总上界。
 
 ### 没做、交回协调者的
 
@@ -338,3 +343,114 @@ HOTSWAP_PORT=19099 HOTSWAP_UPSTREAM_PORT=18180 scripts/verify-hotswap.sh
 ```
 
 需要 `docker`、`curl`、`python3`（仅标准库）。宿主不需要 Go。
+
+## 首次安装：从未启用插件子系统到插件生效
+
+2026-11-02 实测 `bash scripts/verify-first-install.sh` 退出 0，打印 PASS。
+**经实测更正：首次安装也不需要重启 CPA。** 不推断早期验证经过。
+推理上游是沿用热替换脚本的 Go SSE 替身，不是真实 Ollama，不验证真实账号额度。
+
+| 环境 | 值 |
+|---|---|
+| CPA / 构建镜像 | `eceasy/cli-proxy-api:v8.0.47` / `golang:1.26-bookworm` |
+| 宿主 | Windows / Git Bash / Docker Desktop |
+| 隔离 | 全新独立容器；全新临时目录独立 bind mount config、plugins、auths；不复用业务数据卷 |
+| 端口 | CPA `127.0.0.1:19999`，假上游 `127.0.0.1:19080` |
+| 初始状态 | `plugins.enabled: false`，插件目录为空；该实例从未启用插件 |
+| 构建 | 证明初始状态后，在源码临时副本的 Go 容器内运行 `bash scripts/build.sh --go`，产出 `dist/ollama-quota-v0.1.2.so` |
+| 实际启用路径 | **`PATCH /v8/management/config`** → HTTP 200 → 运行中加载 |
+
+配置写入前缀必须用 v8：**v8.0.47 没有 `PATCH /v0/management/config`**，
+另一次隔离实测的 v0 PATCH、PUT 均为 HTTP 404；v0 的配置入口只有 `GET /config`
+与 `GET/PUT /config.yaml`。源码的 v8 ConfigV8 在管理保存后直接触发 ApplyConfig，
+不依赖文件系统 watcher；本次实测验证了该路径。README 中有完整 PATCH 示例。
+
+时间线（UTC；原始日志为 UTC+8）：
+
+| 时间 | 事件 |
+|---|---|
+| 04:24:55.947775271 | CPA StartedAt；04:24:56 脚本记录容器创建完成 |
+| 启动后、长请求前 | 总开关 false、plugins 空数组、日志无 plugin loaded；随后编译、复制 .so |
+| 04:25:17 | 开始 40 秒 SSE 请求，收到首 token 后等 8 秒 |
+| 04:25:27 | PATCH 配置；HTTP 200；日志 plugin loaded、plugin registered；API 确认注册 |
+| 04:25:57 | 长请求完整结束；随后清理本次两个容器及全部临时目录 |
+
+| 断言 | 结果 | 证据 |
+|---|---|---|
+| 初始未启用、未加载 | PASS | plugins_enabled 为 false、plugins 空数组，日志无 plugin loaded |
+| 管理接口写入 | PASS | `PATCH /v8/management/config -> HTTP 200`，响应 status 为 ok、config-version 为 8 |
+| 加载与注册日志 | PASS | `pluginhost: plugin loaded plugin_id=ollama-quota version=0.1.2`；`pluginhost: plugin registered plugin_id=ollama-quota` |
+| 管理面注册 | PASS | id 为 ollama-quota、registered 为 true、version 为 0.1.2 |
+| 在途长流完整 | PASS | curl exit 0；8207 bytes；40/40 distinct tokens；`[DONE]`、`finish_reason=stop`、usage 全到 |
+| 跨 PATCH 首次启用 | PASS | 实测 40s；启用确认 +10s，确认后 curl 仍在运行 |
+| PID 不变、进程未重启 | PASS | before / mid / after 都是 `884421` |
+| StartedAt 不变 | PASS | `2026-11-02T04:24:55.947775271Z` 前后相同，中途完整 identity 也相同 |
+| RestartCount 不变 | PASS | 前 / 中 / 后均为 `0` |
+| 无 error/fatal/panic | PASS | `0 error/fatal lines`，`CPA did not panic — clean` |
+
+关键原始输出：
+
+```text
+=== assertions
+
+request timeline (UTC)
+  started         2026-11-02T04:25:17Z
+  enable confirmed  +10s
+  ended           2026-11-02T04:25:57Z
+  measured        40s (the acceptance gate needs >30s)
+  response        8207 bytes, 40/40 distinct tokens
+
+CPA process
+  PID           before=884421  mid=884421  after=884421
+  StartedAt     before=2026-11-02T04:24:55.947775271Z  after=2026-11-02T04:24:55.947775271Z
+  RestartCount  before=0  after=0
+
+[2026-11-02 12:25:27] [--------] [info ] [host.go:362] pluginhost: plugin loaded plugin_id=ollama-quota version=0.1.2 path=/data/plugins/ollama-quota-v0.1.2.so
+[2026-11-02 12:25:27] [--------] [info ] [host.go:385] pluginhost: plugin registered plugin_id=ollama-quota plugin_name=ollama-quota version=0.1.2 path=/data/plugins/ollama-quota-v0.1.2.so
+  CPA started     2026-11-02T04:24:56Z
+  enable began    2026-11-02T04:25:27Z
+  registered      2026-11-02T04:25:27Z
+  enable path     PATCH /v8/management/config
+results
+  PASS  the in-flight request returned cleanly — curl exit 0
+  PASS  the response carried a body — 8207 bytes
+  PASS  the stream reached its terminator — saw [DONE]
+  PASS  the upstream finished normally — finish_reason=stop
+  PASS  the final usage chunk arrived — completion_tokens present
+  PASS  every token arrived — 40/40
+  PASS  the request spanned first enable — started 2026-11-02T04:25:17Z, enable at +10s, ended 2026-11-02T04:25:57Z
+  PASS  the request outlived 30 seconds — measured 40s
+  PASS  the CPA process kept its PID — 884421 throughout
+  PASS  the container was not restarted — StartedAt unchanged
+  PASS  no restart was counted — RestartCount 0
+  PASS  the new plugin version is live — v0.1.2
+  PASS  CPA logged plugin loaded plugin_id=ollama-quota
+  PASS  CPA logged plugin registered plugin_id=ollama-quota
+  PASS  all identity fields unchanged before/during/after
+  PASS  initial subsystem disabled without loaded plugin — checked API and logs before copying .so
+  PASS  no quiesce drain timeout was logged — first installation does not exercise replacement drain
+  PASS  CPA logged no errors — 0 error/fatal lines
+  PASS  CPA did not panic — clean
+
+PASS  first install verified: a 40s request (measured) crossed first enable intact, the CPA process kept PID 884421, and v0.1.2 is live
+
+=== cleanup
+    removed the CPA container this run started (f7af78dbb6e8fe7a9e65000455a742bc203c4f3de557863fbd493c47ba297a0f)
+    removed the upstream container this run started (9284fb5b6c76f3a49cabd1c987e33e11c47303d2e3fed90db06bf06fe30fd513)
+    removed build scratch /tmp/first-install-src.dZ5y0I
+    removed /tmp/ollama-first-install.oONX1L
+```
+
+备选文件路径也单独实测通过：04:20:21—04:21:01 的 40 秒流跨过容器内
+原位编辑配置与 watcher 加载（04:20:31），40/40 token 全到，PID 全程 878549，
+StartedAt 和 RestartCount 不变。该次实测是在隔离容器内生成临时内容再 `cat` 原位覆盖；
+**宿主侧编辑 bind mount 文件未验证**，可能不触发容器内 watcher。
+单文件挂载不能用 `sed -i` 重命名。
+优先使用上面已经跑通的 v8 管理接口。
+
+复跑：`bash scripts/verify-first-install.sh`。端口变量是 `FIRST_INSTALL_PORT`、
+`FIRST_INSTALL_UPSTREAM_PORT`；拒绝 18999 / 18080 和相同端口。沿用热替换脚本的
+端口、容器名、挂载祖先/后代检查，所有 preflight 拒绝都在任何容器创建前。
+清理只使用本次 `docker run -d` 返回的 CID；构建容器用 `--rm`，退出时终止本次 curl
+并清理全部临时目录（失败也清理）。短流仅允许 `--debug`，不给验收 PASS。
+首次安装不覆盖替换时的 drain；本次没有发现插件代码问题，没有改 `internal/` 或新增依赖。
