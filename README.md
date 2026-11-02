@@ -12,8 +12,9 @@ CPA 有一个 `QuotaProvider` 接口，插件实现它就能把某个供应商�
 
 ## 硬约束
 
-**装上之后，升级不重启 CPA 进程。** 首次启用插件子系统要重启一次（见下面的安装步骤）；
-之后换版本靠 CPA 的插件热加载，按文件名里的版本号识别；插件必须能在换版本时安全卸载
+**首次安装和升级都不需要重启 CPA 进程。** 经隔离容器实测更正：从插件总开关关闭到
+首次加载也可以在运行中完成（见下面的安装步骤与实测报告）。之后换版本靠 CPA 的插件热加载，
+按文件名里的版本号识别；插件必须能在换版本时安全卸载
 （`plugin.quiesce` → 卸载 → 加载新版本 → `plugin.register`），在途的推理请求不受影响。
 
 **凭据不外泄。** Ollama 的 session cookie 和 API Key 是高价值凭证，不能出现在日志、错误字符串、
@@ -77,7 +78,7 @@ scripts/build.sh --go               # 用本机的 Go 和 C 工具链编译当�
    cp dist/ollama-quota-v0.1.2.so /path/to/cpa/plugins/
    ```
 
-2. 在 CPA 的 `config.yaml` 里打开插件并允许本插件。一份完整的例子：
+2. 准备插件配置，打开总开关并允许本插件。一份完整的 `config.yaml` 例子：
 
    ```yaml
    config-version: 8
@@ -107,7 +108,22 @@ scripts/build.sh --go               # 用本机的 Go 和 C 工具链编译当�
    实测（v8.0.47）：带不带这一行、旧版平铺写法（`port` / `remote-management`）还是 v8 嵌套写法，
    启动后 `plugins.configs` 都保留、插件都正常注册。缺它不会导致插件被卸载。
 
-3. **首次启用插件子系统要重启一次 CPA**；之后换版本不用重启。启动日志里应该出现：
+3. **在运行中开启，不重启。** `.so` 放进 `plugins/` 后，应用上面的配置即可首次加载。
+   v8.0.47 的配置写入接口使用 **`/v8/management/config`**：
+
+   ```sh
+   curl -X PATCH http://127.0.0.1:8317/v8/management/config \
+     -H "Authorization: Bearer <mgmt-key>" \
+     -H 'Content-Type: application/json' \
+     -d '{"plugins":{"enabled":true,"dir":"plugins","configs":{"ollama-quota":{"enabled":true}}}}'
+   ```
+
+   v8.0.47 没有 `PATCH /v0/management/config`（实测 404），v0 的配置入口只有
+   `GET /config` 和 `GET/PUT /config.yaml`。备选是直接编辑 `config.yaml`，由 watcher
+   捕获并应用；Docker Desktop 的宿主 bind mount 写入可能不产生容器内 inotify 事件，
+   优先使用管理接口。请确认加载日志、注册接口及 **进程 PID 不变、没有重启**，
+   详见[首次安装实测](docs/hotswap-verification.md#首次安装从未启用插件子系统到插件生效)。
+   运行中的日志里应该出现：
 
    ```
    pluginhost: plugin loaded plugin_id=ollama-quota version=0.1.2
@@ -135,11 +151,14 @@ scripts/build.sh --go               # 用本机的 Go 和 C 工具链编译当�
    进程不重启；之后的额度页里不再有 Ollama 行。**注意这条命令会把 `plugins.configs.ollama-quota`
    从 `config.yaml` 里删掉**，想重新装回来要再把上面那段加回去。
 
-> **`quiesce` 的排空是「有界保证」**：插件会等在途的采集宿主调用返回，上限是一次采集预算
-> （默认 20 秒，见 `ollama.DefaultTimeout`）加 2 秒余量。
+> **`quiesce` 的排空是「有界保证」**：依次判定 collector stops、`Provider.Track` 取数、
+> 宿主回调三组工作，最坏等待上界约为「各 collector stop 预算之和 + 5 秒 + 5 秒」。
+> 单个默认 collector 的 stop 预算是 20 秒加 2 秒余量，因此总上界约 32 秒；
+> **正常情况远小于这个值**，工作已结束就立即继续，不会每次都等满预算。
 > - 上限内排空完成 → `plugin.quiesce` 返回成功，库可以安全卸载。
-> - 超过上限（宿主没响应取消）→ 返回错误 `quiesce_incomplete`，**不是成功**：此时卸载会把
->   仍有回调在跑的库换掉。
+> - 超过上限（宿主没响应取消）→ 返回错误 `quiesce_drain_timeout`，**不是成功**；
+>   `detail.in_flight` / `detail.host_pending` / `detail.unsettled` 报告未完成工作。此时卸载
+>   会把仍有回调在跑的库换掉。
 >
 > 为什么要设上限而不是一直等：宿主回调是同步 C 调用，插件无法中断它；无限等会让一次卡死的
 > 采集永久堵住热替换。
@@ -176,8 +195,9 @@ scripts/build.sh --go               # 用本机的 Go 和 C 工具链编译当�
 
 - [需求 SPEC](docs/spec.md)
 - [编排配置](docs/agents/orchestration.md)
-- [热插拔实测](docs/hotswap-verification.md)——升级插件不重启 CPA 的实测报告，脚本是
-  `scripts/verify-hotswap.sh`；安全前置的反向验证是 `scripts/verify-hotswap-guards.sh`
+- [热插拔实测](docs/hotswap-verification.md)——首次安装和升级不重启 CPA 的实测报告，脚本是
+  `scripts/verify-first-install.sh` 与 `scripts/verify-hotswap.sh`；热替换安全前置的反向验证是
+  `scripts/verify-hotswap-guards.sh`
 
 ## 许可
 
