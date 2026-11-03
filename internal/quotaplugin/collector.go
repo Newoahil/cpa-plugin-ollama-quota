@@ -85,6 +85,16 @@ func (c *collector) sweepOnceSafely(ctx context.Context) (refreshed, failed int,
 	}()
 
 	bridge := c.provider.bridge()
+	// Page configuration is independently collectable, including when the host
+	// has no Ollama auth file or cannot enumerate its credential directory.
+	if key, err := c.provider.settings.load(); err == nil && key != "" {
+		if _, err := c.provider.fetchQuota(ctx, pluginapi.QuotaFetchRequest{Provider: QuotaIdentifier}, ""); err != nil {
+			failed++
+		} else {
+			refreshed++
+		}
+		return refreshed, failed, false
+	}
 	// The enumeration is bounded by the same per-attempt budget as a collection:
 	// it is host code that can block, and it runs before any fetch, so an
 	// unbounded host.auth.list would hold the sweep — and therefore quiesce —
