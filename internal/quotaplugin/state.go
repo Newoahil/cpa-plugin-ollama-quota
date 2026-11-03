@@ -251,6 +251,7 @@ func (s *State) Register(configYAML []byte) (Config, error) {
 	// visible to a drain that is about to report on this instance.
 	s.phase = PhaseActive
 	s.config = cfg
+	s.provider.settings.setDirectory(cfg.StateDir)
 	s.provider.Reset()
 	start := s.collectorStart
 	s.mu.Unlock()

@@ -48,6 +48,10 @@ omc 里已有这两条路的实现（`internal/ollama/`，`LambdaTheory/oh-my-cp
 
 ## 构建
 
+本次配置页面版本为 **0.1.3**，发布目标为 **linux/arm64**，产物名
+`ollama-quota-v0.1.3-linux-arm64.so`。下方脚本默认使用主机架构，不能将本机 amd64
+自测库用作 arm64 发布产物；最终产物需由安排的 arm64 构建机提供。
+
 本插件编译成 CPA 的动态库插件（`-buildmode=c-shared`）。本机没有 Go，用 Docker 编译 Linux 产物：
 
 ```sh
@@ -65,6 +69,43 @@ scripts/build.sh --go               # 用本机的 Go 和 C 工具链编译当�
 没有版本后缀的库会被当成同一个文件，不会触发热替换。
 
 ## 怎么装进 CPA 测试
+
+### 配置页面（0.1.3）
+
+插件启用后，管理台左侧「插件」分组下出现「Ollama 额度」。页面地址为
+`/v0/resource/plugins/ollama-quota/settings`，页面不需要鉴权，也不包含任何密钥。
+在页面填入 CPA 管理密钥后读取配置，再填写 Ollama API Key 并点击「保存并采集」。
+页面显示配置状态、打码尾号、最近成功采集时间和余额；失败会显示原因，旧余额会标记过期。
+Ollama API Key 提交后清空输入框，接口不返回明文；重开页面仍能读取已配置状态。
+
+页面选择手动输入管理密钥，每次调用管理接口时带 Bearer；管理密钥存在此浏览器的
+localStorage 中，可点击「忘记管理密钥」清除。Ollama API Key 不存浏览器 localStorage。
+页面不依赖管理台的私有登录存储或外部 CDN。
+
+在 `plugins.configs.ollama-quota` 下可以配置：
+
+```yaml
+interval_seconds: 900
+state_dir: /path/to/persistent/ollama-quota
+```
+
+`state_dir` 必须指向插件专用目录。目录权限 0700，内部 `settings.json` 权限 0600，
+文件只保存页面提交的 API Key。未设置时使用 `os.UserConfigDir()/cpa-plugin-ollama-quota`；
+无法取得用户配置目录时退到 `os.UserHomeDir()/cpa-plugin-ollama-quota`。
+容器部署应显式把 `state_dir` 指向可写且持久挂载的目录，保证换容器后配置仍在。
+不要把这个目录或 settings.json 提交到 Git。
+
+凭证优先级为：页面保存的 Key → CPA 凭证存储（StorageJSON / host.auth.get）→
+QuotaFetchRequest.Metadata。沿用已有 CPA 凭证时，无需固定 auths 路径；以运行实例配置为准。
+有页面配置时，即使 CPA 没有 Ollama auth 文件，页面刷新和定时采集仍可工作。
+
+管理接口（都经过 CPA 管理鉴权）：
+
+- `GET /v0/management/plugins/ollama-quota/settings`：配置状态与最近结果。
+- `POST /v0/management/plugins/ollama-quota/settings`：JSON `{"api_key":"..."}`，保存后立即采集。
+- `POST /v0/management/plugins/ollama-quota/refresh`：刷新已配置账号的余额。
+
+以下安装与热更新实测记录针对 **CPA v8.0.47 / 插件 v0.1.2**，不是 v0.1.3 的实测结论。
 
 下面这份配置在 `CLIProxyAPI v8.0.47` 上验过：插件加载、注册、额度接口都通。
 

@@ -17,6 +17,7 @@ const defaultIntervalSeconds = 900
 // reads the plugin-owned keys.
 type Config struct {
 	IntervalSeconds int
+	StateDir        string
 }
 
 // ParseConfig reads interval_seconds out of the config block CPA sends.
@@ -40,6 +41,21 @@ func ParseConfig(raw []byte) (Config, error) {
 		key, value, found := strings.Cut(line, ":")
 		if !found {
 			// A list item or a bare key of a nested block.
+			continue
+		}
+		if strings.TrimSpace(key) == "state_dir" {
+			value = strings.TrimSpace(value)
+			if strings.HasPrefix(value, "\"") {
+				parsed, err := strconv.Unquote(value)
+				if err != nil {
+					return cfg, fmt.Errorf("config line %d: state_dir must be a string", lineNo)
+				}
+				cfg.StateDir = parsed
+			} else if strings.HasPrefix(value, "'") && strings.HasSuffix(value, "'") {
+				cfg.StateDir = strings.ReplaceAll(value[1:len(value)-1], "''", "'")
+			} else {
+				cfg.StateDir = value
+			}
 			continue
 		}
 		if strings.TrimSpace(key) != "interval_seconds" {
