@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Package a versioned Linux/arm64 plugin with a SHA-256 of the whole ZIP.
 
-    python scripts/package-release.py --version v0.1.2
-    python scripts/package-release.py --version v0.1.2 --library dist/build/ollama-quota-v0.1.2.so
+    python scripts/package-release.py --version v0.2.0
+    python scripts/package-release.py --version v0.2.0 --library dist/build/ollama-quota-v0.2.0.so
 
 Uses only the Python standard library. The ZIP contains just the shared library
 at its root; checksums.txt stays beside it. Use a fresh output directory for each
@@ -74,7 +74,7 @@ def package(version, library, output_dir):
     output_dir.mkdir(parents=True, exist_ok=True)
     if any(output_dir.iterdir()):
         raise ValueError("output directory must be empty: %s" % output_dir)
-    archive_path = output_dir / ("%s-v%s-linux-arm64.zip" % (name, version))
+    archive_path = output_dir / ("%s_%s_linux_arm64.zip" % (name, version))
     # Fixed metadata makes the same input produce the same archive on reruns.
     member = zipfile.ZipInfo(library_name, date_time=(1980, 1, 1, 0, 0, 0))
     member.create_system = 3

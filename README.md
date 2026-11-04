@@ -51,7 +51,7 @@ omc 里已有这两条路的实现（`internal/ollama/`，`LambdaTheory/oh-my-cp
 本插件编译成 CPA 的动态库插件（`-buildmode=c-shared`）。本机没有 Go，用 Docker 编译 Linux 产物：
 
 ```sh
-scripts/build.sh                    # linux/amd64 -> dist/ollama-quota-v0.1.2.so
+scripts/build.sh                    # linux/amd64 -> dist/ollama-quota-v0.2.0.so
 scripts/build.sh -o dist/foo.so     # 指定输出路径
 scripts/build.sh --go               # 用本机的 Go 和 C 工具链编译当前平台
 ```
@@ -72,7 +72,7 @@ scripts/build.sh --go               # 用本机的 Go 和 C 工具链编译当�
 ```sh
 MSYS_NO_PATHCONV=1 docker run --rm \
   -v "$(pwd -W 2>/dev/null || pwd):/src" -w /src \
-  -e ASSISTANT_NO_SEND=1 -e RELEASE_VERSION=v0.1.2 \
+  -e ASSISTANT_NO_SEND=1 -e RELEASE_VERSION=v0.2.0 \
   golang:1.26.10-bookworm bash -euc '
     apt-get update -qq
     apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross python3
@@ -91,20 +91,23 @@ MSYS_NO_PATHCONV=1 docker run --rm \
 
 产物在 `dist/release/`：
 
-- `ollama-quota-v0.1.2-linux-arm64.zip`：根目录只有 `ollama-quota-v0.1.2.so`，
+- `ollama-quota_0.2.0_linux_arm64.zip`：根目录只有 `ollama-quota-v0.2.0.so`，
   不含子目录、C 头文件或其他文件；MIT 许可全文保存在 ZIP 注释中。
 - `checksums.txt`：ZIP **整体**的 SHA-256，不是 `.so` 的哈希。
 
 已有 arm64 `.so` 时也可直接使用标准库打包脚本：
 
 ```sh
-ASSISTANT_NO_SEND=1 python3 scripts/package-release.py --version v0.1.2 \
-  --library dist/ollama-quota-v0.1.2.so --output-dir dist/release-check
+ASSISTANT_NO_SEND=1 python3 scripts/package-release.py --version v0.2.0 \
+  --library dist/ollama-quota-v0.2.0.so --output-dir dist/release-check
 ```
 
 每次使用空的输出目录；目录已有内容时脚本会报错，避免覆盖旧包或混用校验和。
 将 ZIP 解压到独立目录后检查仅有一个 `.so`，再按下面的安装步骤放进 CPA；
 解压文件的 SHA-256 应与构建输入一致。
+
+ZIP 文件名遵循官方商店的 `<id>_<version>_<goos>_<goarch>.zip` 契约，版本不带 `v`；
+`checksums.txt` 中使用相同文件名。包内动态库保留 `-v0.2.0` 后缀，供 CPA 识别热升级。
 
 `.github/workflows/release.yml` 支持手动填写版本或匹配 `v*` 的 tag 触发，使用相同的
 Bookworm 工具链构建并检查 Linux/arm64 包。工作流只有 `contents: read` 权限，
