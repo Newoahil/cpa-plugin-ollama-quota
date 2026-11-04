@@ -64,6 +64,53 @@ scripts/build.sh --go               # 用本机的 Go 和 C 工具链编译当�
 产物名里的 `-v<版本>` 不是装饰：CPA 靠文件名里的版本号判断"这是新版本"，
 没有版本后缀的库会被当成同一个文件，不会触发热替换。
 
+## Linux arm64 发布包
+
+生产插件使用 **Linux/arm64**。上面的 `scripts/build.sh` 默认 Docker 构建不保证 arm64，
+发布包使用下面的显式交叉编译流程（Bash / Git Bash，在仓库根目录运行）：
+
+```sh
+MSYS_NO_PATHCONV=1 docker run --rm \
+  -v "$(pwd -W 2>/dev/null || pwd):/src" -w /src \
+  -e ASSISTANT_NO_SEND=1 -e RELEASE_VERSION=v0.1.2 \
+  golang:1.26.10-bookworm bash -euc '
+    apt-get update -qq
+    apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross python3
+    library=$(python3 scripts/package-release.py --version "$RELEASE_VERSION" --check-version)
+    CGO_ENABLED=1 GOOS=linux GOARCH=arm64 CC=aarch64-linux-gnu-gcc \
+      go build -trimpath -buildmode=c-shared -o "dist/$library" ./cmd/plugin
+    python3 scripts/package-release.py --version "$RELEASE_VERSION" --library "dist/$library"
+    cd dist/release
+    sha256sum --check checksums.txt
+  '
+```
+
+`RELEASE_VERSION` 必须与 `internal/quotaplugin/plugin.go` 的 `Version` 一致，允许带 `v` 前缀。
+脚本在编译前检查该版本，打包时再次检查版本和 `.so` 文件名，并读取 ELF 头拒绝非 arm64、
+非 ELF64 或非共享库输入。它不加载动态库；二进制内部的注册版本由本次源码构建保证。
+
+产物在 `dist/release/`：
+
+- `ollama-quota-v0.1.2-linux-arm64.zip`：根目录只有 `ollama-quota-v0.1.2.so`，
+  不含子目录、C 头文件或其他文件；MIT 许可全文保存在 ZIP 注释中。
+- `checksums.txt`：ZIP **整体**的 SHA-256，不是 `.so` 的哈希。
+
+已有 arm64 `.so` 时也可直接使用标准库打包脚本：
+
+```sh
+ASSISTANT_NO_SEND=1 python3 scripts/package-release.py --version v0.1.2 \
+  --library dist/ollama-quota-v0.1.2.so --output-dir dist/release-check
+```
+
+每次使用空的输出目录；目录已有内容时脚本会报错，避免覆盖旧包或混用校验和。
+将 ZIP 解压到独立目录后检查仅有一个 `.so`，再按下面的安装步骤放进 CPA；
+解压文件的 SHA-256 应与构建输入一致。
+
+`.github/workflows/release.yml` 支持手动填写版本或匹配 `v*` 的 tag 触发，使用相同的
+Bookworm 工具链构建并检查 Linux/arm64 包。工作流只有 `contents: read` 权限，
+将 ZIP 与 `checksums.txt` 保存为 Actions artifact `ollama-quota-linux-arm64`；
+它不会创建 tag、创建 GitHub Release 或向官方商店提交内容。
+
 ## 怎么装进 CPA 测试
 
 下面这份配置在 `CLIProxyAPI v8.0.47` 上验过：插件加载、注册、额度接口都通。
