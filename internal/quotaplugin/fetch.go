@@ -2,6 +2,7 @@ package quotaplugin
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"strings"
@@ -134,12 +135,19 @@ func (p *Provider) fetchQuotaWithinBudget(budget context.Context, request plugin
 		return pluginapi.QuotaFetchResponse{}, UnsupportedProviderError{Provider: providerKey}
 	}
 
-	credential, errCredential := p.resolveCredential(budget, request)
+	saved, errCredential := p.settings.load()
+	credential := ollama.Credential{APIKey: saved}
+	if errCredential == nil && saved == "" {
+		credential, errCredential = p.resolveHostCredential(budget, request)
+	}
 	if errCredential != nil {
 		return pluginapi.QuotaFetchResponse{}, errCredential
 	}
 
 	key := readingKey(request)
+	if saved != "" {
+		key = configuredReadingKey(credential.APIKey)
+	}
 	now := p.now()
 
 	if until, waiting := p.store.backoff(key, now); waiting {
@@ -188,27 +196,42 @@ func (p *Provider) fetchQuotaWithinBudget(budget context.Context, request plugin
 // than trusting one field is what keeps a credential that is perfectly usable
 // from being reported incomplete.
 func (p *Provider) resolveCredential(ctx context.Context, request pluginapi.QuotaFetchRequest) (ollama.Credential, error) {
-	credential, errStored := credentialFromStorage(request.StorageJSON, request.Metadata)
+	saved, err := p.settings.load()
+	if err != nil {
+		return ollama.Credential{}, err
+	}
+	if saved != "" {
+		return ollama.Credential{APIKey: saved}, nil
+	}
+	return p.resolveHostCredential(ctx, request)
+}
+
+func (p *Provider) resolveHostCredential(ctx context.Context, request pluginapi.QuotaFetchRequest) (ollama.Credential, error) {
+	credential, errStored := credentialFromStorage(request.StorageJSON, nil)
 	if errStored == nil {
 		return credential, nil
 	}
 
 	index := strings.TrimSpace(request.AuthIndex)
 	if index == "" {
-		return ollama.Credential{}, errStored
+		return credentialFromStorage(request.StorageJSON, request.Metadata)
 	}
 	bridge := p.bridge()
 	if bridge == nil || bridge.call == nil {
-		return ollama.Credential{}, errStored
+		return credentialFromStorage(request.StorageJSON, request.Metadata)
 	}
 	auth, errGet := bridge.getAuth(ctx, index)
 	if errGet != nil {
 		// The stored JSON was unusable and there is no better source. Report
 		// the original problem: the missing field is what the operator has to
 		// fix, and the bridge error may only say the file is unreadable.
-		return ollama.Credential{}, errStored
+		return credentialFromStorage(request.StorageJSON, request.Metadata)
 	}
 	return credentialFromStorage(auth.JSON, request.Metadata)
+}
+
+func configuredReadingKey(key string) string {
+	return fmt.Sprintf("configured:%x", sha256.Sum256([]byte(key)))
 }
 
 // collect performs one collection through the host transport.

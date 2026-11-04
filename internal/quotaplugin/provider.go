@@ -32,17 +32,16 @@ func (r DrainReport) Unwrap() error { return ErrQuiesceIncomplete }
 // internal form this package uses so it can be tested without the SDK's wire
 // types. The RPC layer (rpc.go) is the only adapter between the two.
 //
-// A Provider never holds a credential. It is handed one per call, uses it for
-// the duration of one collection, and keeps only the resulting figures. That is
-// what makes it safe to keep a Provider alive across a quiesce while the host
-// swaps credentials underneath it.
+// Credentials are read per attempt from plugin settings or host storage.
+// Only resulting figures and a settings directory are retained in memory.
 type Provider struct {
 	// timeout bounds one collection (SPEC 4.4).
 	timeout time.Duration
 	// now is the clock, injected by tests.
 	now func() time.Time
 	// store keeps the last verified reading per credential.
-	store *store
+	store    *store
+	settings settingsStore
 
 	mu sync.Mutex
 	// host is the callback bridge of the generation currently serving. It is

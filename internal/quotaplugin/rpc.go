@@ -58,8 +58,8 @@ type quotaFetchRequest struct {
 	HostCallbackID string `json:"host_callback_id,omitempty"`
 }
 
-// Registration mirrors the host's rpcRegistration schema. Only quota_provider
-// is declared: the plugin does not touch auth, routing, or request paths.
+// Registration mirrors the host's rpcRegistration schema. The plugin exposes
+// quota collection and its configuration page, without changing inference routes.
 type Registration struct {
 	SchemaVersion uint32              `json:"schema_version"`
 	Metadata      pluginapi.Metadata  `json:"metadata"`
@@ -70,6 +70,7 @@ type Registration struct {
 // other flag is left at its zero value.
 type RegistrationCapable struct {
 	QuotaProvider bool `json:"quota_provider"`
+	ManagementAPI bool `json:"management_api"`
 }
 
 // Handler dispatches RPC methods against one plugin instance.
@@ -129,6 +130,10 @@ func (h *Handler) Handle(method string, request []byte) ([]byte, error) {
 		return h.handleFetch(request)
 	case pluginabi.MethodQuotaReset:
 		return h.handleReset(request)
+	case pluginabi.MethodManagementRegister:
+		return OKEnvelope(managementRegistration())
+	case pluginabi.MethodManagementHandle:
+		return h.handleManagement(request)
 	default:
 		// The host probes optional methods and treats unknown_method as
 		// "not supported", so anything outside this surface reports that way.
@@ -177,7 +182,7 @@ func (h *Handler) handleRegister(raw []byte) ([]byte, error) {
 	reg := Registration{
 		SchemaVersion: SchemaVersion,
 		Metadata:      metadata(cfg),
-		Capabilities:  RegistrationCapable{QuotaProvider: true},
+		Capabilities:  RegistrationCapable{QuotaProvider: true, ManagementAPI: true},
 	}
 	if errConfig != nil {
 		// Keep the plugin loadable: the host drops a registration that
@@ -304,6 +309,7 @@ func metadata(cfg Config) pluginapi.Metadata {
 		Author:           "LambdaTheory",
 		GitHubRepository: "https://github.com/LambdaTheory/cpa-plugin-ollama-quota",
 		ConfigFields: []pluginapi.ConfigField{
+			{Name: "state_dir", Type: pluginapi.ConfigFieldTypeString, Description: "Writable persistent directory for settings.json; defaults to the user config directory/cpa-plugin-ollama-quota."},
 			{
 				Name:        "interval_seconds",
 				Type:        pluginapi.ConfigFieldTypeInteger,
