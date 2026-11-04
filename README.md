@@ -202,5 +202,5 @@ scripts/build.sh --go               # 用本机的 Go 和 C 工具链编译当�
 
 ## 许可
 
-待定：omc 的 ollama 解析思路源自 LGPL-3.0-only 的上游项目，复用前需要核对许可证义务。
-见 SPEC 的「许可」一节。
+本仓库采用 [MIT License](LICENSE)，著作权人为 Newoahil。
+Ollama 解析仅复用思路、独立实现，不复制上游源码；来路见 SPEC 的「许可」一节。
