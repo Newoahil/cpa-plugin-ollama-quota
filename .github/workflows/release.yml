@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Plugin version matching plugin.go (for example v0.2.0)
+        description: Plugin version matching plugin.go (for example v0.2.1)
         required: true
         type: string
   push:
@@ -49,7 +49,7 @@ jobs:
           GOOS: linux
           GOARCH: arm64
           CC: aarch64-linux-gnu-gcc
-        run: go build -trimpath -buildmode=c-shared -o "$LIBRARY" ./cmd/plugin
+        run: go build -trimpath -buildvcs=false -buildmode=c-shared -o "$LIBRARY" ./cmd/plugin
 
       - name: Package and check architecture
         run: |

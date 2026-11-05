@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Package a versioned Linux/arm64 plugin with a SHA-256 of the whole ZIP.
 
-    python scripts/package-release.py --version v0.2.0
-    python scripts/package-release.py --version v0.2.0 --library dist/build/ollama-quota-v0.2.0.so
+    python scripts/package-release.py --version v0.2.1
+    python scripts/package-release.py --version v0.2.1 --library dist/build/ollama-quota-v0.2.1.so
 
 Uses only the Python standard library. The ZIP contains just the shared library
 at its root; checksums.txt stays beside it. Use a fresh output directory for each
