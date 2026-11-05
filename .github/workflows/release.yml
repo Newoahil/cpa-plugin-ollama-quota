@@ -1,0 +1,66 @@
+name: Release package
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Plugin version matching plugin.go (for example v0.2.0)
+        required: true
+        type: string
+  push:
+    tags:
+      - 'v*'
+
+# This workflow builds downloadable artifacts; publishing a Release is separate.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  ASSISTANT_NO_SEND: '1'
+  RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
+
+jobs:
+  linux-arm64:
+    runs-on: ubuntu-24.04
+    container: golang:1.26.10-bookworm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install cross compiler and packaging tools
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross python3
+
+      - name: Check version before building
+        run: |
+          library=$(python3 scripts/package-release.py --version "$RELEASE_VERSION" --check-version)
+          echo "LIBRARY=dist/$library" >> "$GITHUB_ENV"
+
+      - name: Build Linux arm64 shared library
+        env:
+          CGO_ENABLED: '1'
+          GOOS: linux
+          GOARCH: arm64
+          CC: aarch64-linux-gnu-gcc
+        run: go build -trimpath -buildmode=c-shared -o "$LIBRARY" ./cmd/plugin
+
+      - name: Package and check architecture
+        run: |
+          python3 scripts/package-release.py --version "$RELEASE_VERSION" --library "$LIBRARY"
+          cd dist/release
+          sha256sum --check checksums.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ollama-quota-linux-arm64
+          path: |
+            dist/release/*.zip
+            dist/release/checksums.txt
+          if-no-files-found: error

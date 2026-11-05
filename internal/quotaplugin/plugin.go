@@ -19,7 +19,7 @@ const (
 	QuotaIdentifier = "ollama"
 	// Version is stamped into the registration metadata and names the
 	// published artifact the host hot-swaps.
-	Version = "0.1.3"
+	Version = "0.2.0"
 	// SchemaVersion is the RPC contract this plugin targets. Versions 2-8 add
 	// request-body and interceptor features the quota path does not use, and
 	// the host rejects a plugin reporting a schema newer than the host speaks.
