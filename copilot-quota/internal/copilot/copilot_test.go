@@ -137,6 +137,8 @@ func TestParseRejectsUnrecognisedShapes(t *testing.T) {
 		"percent out of range":  `{"quota_snapshots":{"premium_interactions":{"percent_remaining":150}}}`,
 		"percent not a number":  `{"quota_snapshots":{"premium_interactions":{"percent_remaining":"90"}}}`,
 		"limited without total": `{"limited_user_quotas":{"chat":400}}`,
+		// A null value must not be read as 0, which would report "100% used".
+		"limited value is null": `{"copilot_plan":"individual","limited_user_quotas":{"chat":null},"monthly_quotas":{"chat":500}}`,
 		"not json":              `not json at all`,
 		"json array":            `[{"percent_remaining":90}]`,
 	}

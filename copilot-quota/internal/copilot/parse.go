@@ -224,16 +224,19 @@ func stringValue(value *string) string {
 }
 
 // numberFromRaw decodes a JSON number, rejecting anything else. A string is not
-// coerced: upstream data that changed type is not a number we can trust.
+// coerced: upstream data that changed type is not a number we can trust. A
+// literal null is rejected too: it decodes into a zero, which would turn "this
+// bucket has no value" into a reading of 0 and a "100% used" card upstream
+// never reported.
 func numberFromRaw(raw json.RawMessage) (float64, bool) {
-	var value float64
-	if err := json.Unmarshal(raw, &value); err != nil {
+	var value *float64
+	if err := json.Unmarshal(raw, &value); err != nil || value == nil {
 		return 0, false
 	}
-	if math.IsNaN(value) || math.IsInf(value, 0) {
+	if math.IsNaN(*value) || math.IsInf(*value, 0) {
 		return 0, false
 	}
-	return value, true
+	return *value, true
 }
 
 // numberValue returns a pointer's value or zero.
