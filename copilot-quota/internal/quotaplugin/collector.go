@@ -1,0 +1,214 @@
+package quotaplugin
+
+import (
+	"context"
+	"strings"
+	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+)
+
+// collector refreshes every Copilot credential on a timer, so the quota page has
+// figures to show before anyone opens it.
+//
+// Exactly one collector goroutine runs per plugin instance, and it is the only
+// goroutine this package starts for itself. A sweep does not fan out: it talks
+// to the credentials one at a time, inline. That costs a slower sweep across
+// several accounts and buys the property the ticket asks for — the goroutine
+// count does not move as refreshes come and go (SPEC 4.4).
+//
+// Reads that arrive between sweeps are served from the cached store, so opening
+// the page does not start a goroutine either.
+type collector struct {
+	provider *Provider
+	interval time.Duration
+	// onSweep, when set, is called after every sweep with its counts. Tests set
+	// it to observe a sweep without sleeping for the interval.
+	onSweep func(refreshed, failed int)
+}
+
+// run is the collector goroutine body. It returns when ctx is cancelled, which
+// is what quiesce and shutdown do (State.SetCollector holds the cancel).
+//
+// The recovery is the outermost frame so nothing — the host bridge, the HTTP
+// layer, a parser reached through reflection — can escape into the CPA process
+// and take the gateway down (SPEC 4.4).
+func (c *collector) run(ctx context.Context) {
+	// An outermost recovery so even a panic during teardown cannot escape into
+	// the CPA process.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			c.safeLog(ctx, "error", "the Copilot quota collector panicked and stopped")
+		}
+	}()
+
+	// The first sweep runs immediately: after a register the page should not
+	// wait a whole interval for its first figures.
+	c.sweepOnce(ctx)
+
+	ticker := time.NewTicker(c.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.sweepOnce(ctx)
+		}
+	}
+}
+
+// sweepOnce refreshes every Copilot credential once.
+//
+// A panic ends this sweep only, never the timer: listAuths and one credential's
+// callbacks are both host code, and losing the background refresh for the rest
+// of the process because one of them panicked is the failure SPEC 4.4 is about.
+// The panic is recorded and the next tick sweeps again.
+func (c *collector) sweepOnce(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+	refreshed, failed, recovered := c.sweepOnceSafely(ctx)
+	if recovered {
+		c.safeLog(ctx, "error", "the Copilot quota collector panicked during a sweep; the next sweep will retry")
+	}
+	c.report(refreshed, failed)
+}
+
+// sweepOnceSafely runs one sweep behind its own recovery and reports how far it
+// got.
+func (c *collector) sweepOnceSafely(ctx context.Context) (refreshed, failed int, recovered bool) {
+	defer func() {
+		if caught := recover(); caught != nil {
+			recovered = true
+		}
+	}()
+
+	bridge := c.provider.bridge()
+	// The enumeration is bounded by the same per-attempt budget as a collection:
+	// it is host code that can block, and it runs before any fetch, so an
+	// unbounded host.auth.list would hold the sweep — and therefore quiesce —
+	// forever (P2-1).
+	listBudget, cancelList := context.WithTimeout(ctx, c.provider.attemptTimeout())
+	entries, errList := bridge.listAuths(listBudget)
+	cancelList()
+	if errList != nil {
+		// The bridge's own message names the callback, never a credential.
+		c.safeLog(ctx, "warning", "the Copilot quota collector could not list credentials: "+errList.Error())
+		return 0, 0, false
+	}
+
+	for _, entry := range entries {
+		if ctx.Err() != nil {
+			return refreshed, failed, false
+		}
+		if !isCopilotCredential(entry) {
+			continue
+		}
+		if authIndexOf(entry) == "" {
+			// host.auth.list falls back to a bare directory listing before the
+			// auth manager is wired, and that listing carries no id or index
+			// (internal/pluginhost/auth_callbacks.go listAuthFilesFromDisk). Such
+			// an entry is not addressable, so no host.auth.get can read it. It is
+			// skipped rather than counted as a failure: the host will list the
+			// same credentials with their indexes on the next sweep, and the
+			// manual refresh path is unaffected because it arrives with an index.
+			continue
+		}
+		if c.refreshOne(ctx, bridge, entry) {
+			refreshed++
+		} else {
+			failed++
+		}
+	}
+	return refreshed, failed, false
+}
+
+// refreshOne refreshes one credential, reporting whether it produced a reading.
+func (c *collector) refreshOne(ctx context.Context, bridge *hostBridge, entry pluginapi.HostAuthFileEntry) (ok bool) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			// The recovered value is never formatted into the message: it can be
+			// anything the code that panicked chose.
+			c.safeLog(ctx, "error", "the Copilot quota collector panicked while refreshing a credential")
+			ok = false
+		}
+	}()
+
+	index := authIndexOf(entry)
+
+	// One deadline for the whole attempt: credential read plus HTTP. It covers
+	// host.auth.get, which runs before any request and therefore used to fall
+	// outside every budget (P2-1): with the collector's bare context,
+	// callBounded took its synchronous path, so a host that never answered
+	// here parked the sweep -- and the stop path -- indefinitely.
+	attempt, cancelAttempt := context.WithTimeout(ctx, c.provider.attemptTimeout())
+	defer cancelAttempt()
+
+	auth, errGet := bridge.getAuth(attempt, index)
+	if errGet != nil {
+		// The bridge's message names the callback and, at most, the credential's
+		// index — never its contents. It is the only way to tell "the host has
+		// not loaded this credential yet", which is normal during start-up, from
+		// "the host refuses this callback".
+		c.safeLog(ctx, "warning", "the Copilot quota collector could not read a credential: "+errGet.Error())
+		return false
+	}
+
+	request := pluginapi.QuotaFetchRequest{
+		AuthIndex:   index,
+		AuthID:      entry.ID,
+		Provider:    CredentialProvider,
+		StorageJSON: auth.JSON,
+	}
+	// Collection failures are already recorded in the store as that
+	// credential's stale reason, so the sweep only needs the count.
+	// The same budget continues into the HTTP leg: fetchQuotaWithinBudget does
+	// not mint a second deadline, so the two halves cannot each claim the full
+	// timeout.
+	if _, errFetch := c.provider.fetchQuotaWithinBudget(attempt, request, ""); errFetch != nil {
+		return false
+	}
+	return true
+}
+
+// isCopilotCredential reports whether a host credential belongs to this plugin.
+//
+// Unlike a plugin that owns its own credentials, this one declares no
+// AuthProvider: the Copilot credentials are written by the syepes auth plugin,
+// whose files carry `type: "copilot"`. A credential that declares no provider
+// at all is skipped rather than assumed to be Copilot's — collecting it would
+// always fail with "no github_access_token" and pollute the page.
+func isCopilotCredential(entry pluginapi.HostAuthFileEntry) bool {
+	provider := strings.ToLower(strings.TrimSpace(entry.Provider))
+	if provider == "" {
+		provider = strings.ToLower(strings.TrimSpace(entry.Type))
+	}
+	return provider == CredentialProvider
+}
+
+// authIndexOf prefers the runtime index, falling back to the credential id.
+func authIndexOf(entry pluginapi.HostAuthFileEntry) string {
+	if index := strings.TrimSpace(entry.AuthIndex); index != "" {
+		return index
+	}
+	return strings.TrimSpace(entry.ID)
+}
+
+// safeLog records a line without letting the logger itself panic the collector.
+func (c *collector) safeLog(ctx context.Context, level, message string) {
+	bridge := c.provider.bridge()
+	if bridge == nil || bridge.call == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	bridge.logNote(ctx, level, message)
+}
+
+// report publishes one sweep's counts to the test hook, if any.
+func (c *collector) report(refreshed, failed int) {
+	if c.onSweep == nil {
+		return
+	}
+	c.onSweep(refreshed, failed)
+}
