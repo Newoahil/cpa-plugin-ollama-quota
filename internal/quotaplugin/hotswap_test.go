@@ -204,23 +204,21 @@ func TestFetchAfterQuiesceIsRefusedWithAClearError(t *testing.T) {
 	}
 }
 
-// The plugin only owns the quota path. This test pins the whole inference
-// surface — every method a CPA inference or executor host call can reach — as
-// refused with unknown_method both before and after quiesce, so an accidental
-// capability can never appear without this test failing.
+// The plugin owns the quota path and, since 0.2.0, the inference path for
+// provider "ollama" (scheme B: the executor is what makes a file auth usable
+// without a second, synthesized credential). Everything else — request
+// translation, interceptors, routing, scheduling — is still refused with
+// unknown_method in every phase, so an accidental capability can never appear
+// without this test failing.
 //
-// It is the unit-level half of the "quiesce must not touch inference" claim.
-// The end-to-end half (a live 40-second stream crossing a plugin swap on a real
-// CPA) lives in scripts/verify-hotswap.sh, because only a real host can show
-// that CPA's request path never enters the plugin library.
-func TestPluginNeverServesInferenceSurface(t *testing.T) {
+// The executor surface is covered by executor_test.go, including the phase it
+// must refuse in: quiesce stops NEW execution but lets in-flight execution
+// finish (SPEC 4.1), which is the opposite of what the removed "never serves
+// inference" assertion encoded.
+func TestPluginOnlyServesItsOwnCapabilities(t *testing.T) {
 	// Real pluginabi method names, not invented ones: a typo here would make
 	// the test pass for the wrong reason.
 	methods := []string{
-		pluginabi.MethodExecutorExecute,
-		pluginabi.MethodExecutorExecuteStream,
-		pluginabi.MethodExecutorCountTokens,
-		pluginabi.MethodExecutorHTTPRequest,
 		pluginabi.MethodRequestTranslate,
 		pluginabi.MethodRequestNormalize,
 		pluginabi.MethodRequestInterceptBefore,
