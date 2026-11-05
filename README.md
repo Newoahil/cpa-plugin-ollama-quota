@@ -51,7 +51,7 @@ omc 里已有这两条路的实现（`internal/ollama/`，`LambdaTheory/oh-my-cp
 本插件编译成 CPA 的动态库插件（`-buildmode=c-shared`）。本机没有 Go，用 Docker 编译 Linux 产物：
 
 ```sh
-scripts/build.sh                    # linux/amd64 -> dist/ollama-quota-v0.1.2.so
+scripts/build.sh                    # linux/amd64 -> dist/ollama-quota-v0.2.0.so
 scripts/build.sh -o dist/foo.so     # 指定输出路径
 scripts/build.sh --go               # 用本机的 Go 和 C 工具链编译当前平台
 ```
@@ -75,7 +75,7 @@ scripts/build.sh --go               # 用本机的 Go 和 C 工具链编译当�
 1. 把 `dist/` 里的库放进 CPA 的插件目录（路径相对于 CPA 的工作目录）：
 
    ```sh
-   cp dist/ollama-quota-v0.1.2.so /path/to/cpa/plugins/
+   cp dist/ollama-quota-v0.2.0.so /path/to/cpa/plugins/
    ```
 
 2. 准备插件配置，打开总开关并允许本插件。一份完整的 `config.yaml` 例子：
@@ -127,7 +127,7 @@ scripts/build.sh --go               # 用本机的 Go 和 C 工具链编译当�
    运行中的日志里应该出现：
 
    ```
-   pluginhost: plugin loaded plugin_id=ollama-quota version=0.1.2
+   pluginhost: plugin loaded plugin_id=ollama-quota version=0.2.0
    pluginhost: plugin registered plugin_id=ollama-quota ...
    ```
 
@@ -173,7 +173,7 @@ scripts/build.sh --go               # 用本机的 Go 和 C 工具链编译当�
 > 才会返回成功。重试不是「按上一次的结论作答」，而是每次都重新做一遍有界排空判定
 > （上限同上）。
 
-> 当前版本 0.1.2 已接真实采集：凭证里的 `api_key` 走 `GET https://ollama.com/api/balance`，
+> 当前版本 0.2.0 已接真实采集：凭证里的 `api_key` 走 `GET https://ollama.com/api/balance`，
 > 只有 `cookie` 时走 `GET https://ollama.com/settings` 解析 HTML；两条都失败时返回上一次成功读到的
 > 数字并标「已过期」，从没成功过则返回错误、不带数字。插件按 `interval_seconds`（默认 900 秒）
 > 定时采集，也能被 CPA 的额度页刷新按钮触发。
@@ -191,6 +191,37 @@ scripts/build.sh --go               # 用本机的 Go 和 C 工具链编译当�
 > 所以残余的、插件无法察觉也无法撤销的风险是**子域转发**：凭证可能被送到 ollama.com 的子域。
 > 插件无法在事后发现或补救，**这条要改宿主才能根治，需另立 CPA 票**；在宿主修好之前，
 > 本插件不满足 SPEC 4.2 的严格要求。
+
+## 推理：一把 key 同时用于额度和推理（0.2.0 起）
+
+0.1.x 只做额度采集。那时 CPA 没有 `ollama` 这个推理 provider，想让 CPA 真正跑 Ollama 推理，
+唯一的办法是再配一份 `openai-compatibility` 凭证——那是**第二份**凭证，后台定时采集读的是
+`host.auth.list`，看不到这种合成的凭证，额度页因此长期没有数字，两把 key 也容易一把过期一把没过期。
+
+0.2.0 起插件自己声明 `executor` 和 `model_provider`，成为 provider `ollama` 的推理执行者。
+现在同一个凭证文件同时干两件事：
+
+```json
+{"type":"ollama","api_key":"..."}
+```
+
+- `api_key` 既走 `https://ollama.com/v1/chat/completions`（推理），也走 `/api/balance`（额度）；
+- 模型清单不写死：每次凭证注册时用这把 key 打 `GET https://ollama.com/api/tags`，拿这个账号
+  当前能用的模型（`model.for_auth`）。账号变了模型跟着变，不用等插件发版；
+- 只有 `cookie` 的凭证照常报额度，但不能推理（推理只认 API Key）。这不算配置错误：
+  插件不给它注册任何模型，也不报错。
+
+已知取舍：
+
+- **流式不是逐字增量。** 插件把上游 SSE 整段读完再切成帧交给宿主（`executor.execute_stream`
+  同步返回 `chunks`），所以客户端拿到第一帧的时间等于整段生成结束的时间。这是当前宿主协议里
+  同步返回这条路线的形态；要做真增量得走 `host.stream.emit` 异步通道，留作后续。
+- **`executor.count_tokens` 直接返回 501。** Ollama 没有 token 计数接口，猜一个数会违反
+  「宁缺毋错」（SPEC 4.3），宿主会回落到自己的估算器。
+- **`executor.http_request` 只转发到 `https://ollama.com`。** 其它域一律 400，凭证不会被带到
+  别家域名。
+- **热替换不取消在途推理。** SPEC 4.1 要求在途请求跑完，所以执行调用不登记在 `Provider.Track`
+  里；宿主会等它结束，超过 quiesce 的有界预算时如实返回 `quiesce_drain_timeout`。
 
 ## 文档
 
