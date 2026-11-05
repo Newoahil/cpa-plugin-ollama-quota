@@ -256,6 +256,20 @@ func TestCredentialFromStorage(t *testing.T) {
 	if _, err := credentialFromStorage([]byte(`{"github_base_url":"https://github.com","github_access_token":"x"}`), nil); err != nil {
 		t.Errorf("github.com base URL should be accepted: %v", err)
 	}
+	// The field is omitempty, and a writer may store a bare host or the API
+	// host. Neither is an Enterprise tenant, so neither may be refused.
+	for _, baseURL := range []string{"github.com", "api.github.com", "https://api.github.com", "https://github.com/"} {
+		credential := []byte(`{"github_base_url":"` + baseURL + `","github_access_token":"x"}`)
+		if _, err := credentialFromStorage(credential, nil); err != nil {
+			t.Errorf("base URL %q should be accepted: %v", baseURL, err)
+		}
+	}
+	for _, baseURL := range []string{"acme.ghe.com", "https://github.com.acme.example", "https://github.com@evil.example"} {
+		credential := []byte(`{"github_base_url":"` + baseURL + `","github_access_token":"x"}`)
+		if _, err := credentialFromStorage(credential, nil); !errors.Is(err, ErrUnsupportedCredential) {
+			t.Errorf("base URL %q should be refused, got %v", baseURL, err)
+		}
+	}
 
 	for _, message := range []string{ErrIncompleteCredential.Error(), ErrUnsupportedCredential.Error()} {
 		if strings.Contains(message, testToken) {

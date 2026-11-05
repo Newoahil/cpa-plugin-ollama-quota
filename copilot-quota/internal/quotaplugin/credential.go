@@ -81,13 +81,23 @@ func credentialFromStorage(storageJSON []byte, metadata map[string]any) (copilot
 	return credential, nil
 }
 
-// isGitHubDotCom reports whether a stored base URL points at github.com.
+// isGitHubDotCom reports whether a stored base URL points at github.com. A bare
+// host (no scheme) is accepted too: the auth plugin's field is omitempty and
+// some writers store "github.com".
 func isGitHubDotCom(raw string) bool {
-	parsed, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil || parsed.Host == "" {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
 		return false
 	}
-	host := strings.ToLower(parsed.Hostname())
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return false
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		host = strings.TrimSuffix(strings.TrimPrefix(trimmed, "//"), "/")
+	}
+	host = strings.ToLower(host)
 	return host == "github.com" || host == "api.github.com"
 }
 
