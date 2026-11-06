@@ -64,7 +64,8 @@ type quotaFetchRequest struct {
 	HostCallbackID string `json:"host_callback_id,omitempty"`
 }
 
-// Registration mirrors the host's rpcRegistration schema.
+// Registration mirrors the host's rpcRegistration schema. The plugin exposes
+// quota collection, its configuration page, and Ollama inference.
 type Registration struct {
 	SchemaVersion uint32              `json:"schema_version"`
 	Metadata      pluginapi.Metadata  `json:"metadata"`
@@ -87,6 +88,7 @@ type Registration struct {
 // credentials, which is the path a file auth with an API key takes.
 type RegistrationCapable struct {
 	QuotaProvider         bool                         `json:"quota_provider"`
+	ManagementAPI         bool                         `json:"management_api"`
 	ModelProvider         bool                         `json:"model_provider"`
 	Executor              bool                         `json:"executor"`
 	ExecutorModelScope    pluginapi.ExecutorModelScope `json:"executor_model_scope"`
@@ -99,6 +101,7 @@ type RegistrationCapable struct {
 func registeredCapabilities() RegistrationCapable {
 	return RegistrationCapable{
 		QuotaProvider:         true,
+		ManagementAPI:         true,
 		ModelProvider:         true,
 		Executor:              true,
 		ExecutorModelScope:    pluginapi.ExecutorModelScopeBoth,
@@ -178,6 +181,10 @@ func (h *Handler) Handle(method string, request []byte) ([]byte, error) {
 		return h.handleModelStatic(request)
 	case pluginabi.MethodModelForAuth:
 		return h.handleModelForAuth(request)
+	case pluginabi.MethodManagementRegister:
+		return OKEnvelope(managementRegistration())
+	case pluginabi.MethodManagementHandle:
+		return h.handleManagement(request)
 	default:
 		// The host probes optional methods and treats unknown_method as
 		// "not supported", so anything outside this surface reports that way.
@@ -353,6 +360,7 @@ func metadata(cfg Config) pluginapi.Metadata {
 		Author:           "LambdaTheory",
 		GitHubRepository: "https://github.com/LambdaTheory/cpa-plugin-ollama-quota",
 		ConfigFields: []pluginapi.ConfigField{
+			{Name: "state_dir", Type: pluginapi.ConfigFieldTypeString, Description: "Writable persistent directory for settings.json; defaults to the user config directory/cpa-plugin-ollama-quota."},
 			{
 				Name:        "interval_seconds",
 				Type:        pluginapi.ConfigFieldTypeInteger,

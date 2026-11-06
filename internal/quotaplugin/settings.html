@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Ollama 额度</title>
+<style>
+:root{color-scheme:light dark;font:16px/1.6 system-ui,sans-serif;background:#f5f7fa;color:#202b3b}*{box-sizing:border-box}main{max-width:680px;margin:40px auto;padding:28px;background:#fff;border:1px solid #dde3eb;border-radius:16px}h1{margin:0 0 8px;font-size:26px}p{color:#526078}label{display:block;margin:20px 0 6px;font-weight:600}input{width:100%;padding:12px;border:1px solid #aebacc;border-radius:8px;font:inherit}button{margin:20px 8px 0 0;padding:10px 18px;border:0;border-radius:8px;background:#2463dc;color:white;font:inherit;cursor:pointer}button:disabled{opacity:.55;cursor:wait}small{display:block;color:#526078;margin-top:6px}#status{margin-top:24px;padding:16px;border-radius:8px;background:#eef3fa;white-space:pre-line}#message{min-height:26px;color:#a22d2d}@media(prefers-color-scheme:dark){:root{background:#121923;color:#e6edf7}main{background:#1c2635;border-color:#3b485c}p,small{color:#b7c4d8}input{background:#121923;color:#e6edf7}#status{background:#26344a}#message{color:#ffb1ad}}@media(max-width:720px){main{margin:12px;padding:20px}}
+</style>
+<main>
+<h1>Ollama 额度</h1>
+<p>保存 Ollama API Key，立即采集账号余额。</p>
+<label for="managementKey">CPA 管理密钥</label>
+<input id="managementKey" type="password" autocomplete="off" placeholder="输入当前 CPA 的管理密钥">
+<small>管理密钥仅保存在此浏览器，用于请求 CPA 管理接口。请在可信设备上使用。</small>
+<button id="connect" type="button">读取配置</button><button id="forget" type="button">忘记管理密钥</button>
+<form id="settings">
+<label for="apiKey">Ollama API Key</label>
+<input id="apiKey" type="password" autocomplete="new-password" required placeholder="输入新的 API Key">
+<small>保存到插件配置目录；保存后只显示配置状态和打码尾号。</small>
+<button type="submit">保存并采集</button><button id="refresh" type="button">刷新余额</button>
+</form>
+<div id="status" role="status" aria-live="polite">输入管理密钥后读取配置。</div>
+<p id="message" role="alert"></p>
+</main>
+<script>
+'use strict';
+// Resource pages are public. Ask for a management key explicitly rather than
+// embedding a secret or depending on CPAMC's private authentication storage.
+const storageKey='ollama-quota.management-key';
+const managementKey=document.getElementById('managementKey');
+const apiKey=document.getElementById('apiKey');
+const statusBox=document.getElementById('status');
+const message=document.getElementById('message');
+try{managementKey.value=localStorage.getItem(storageKey)||'';}catch{}
+function render(data){
+ const lines=[data.configured?'已配置 '+data.masked_key:'未配置'];
+ lines.push('最近采集：'+(data.collected_at?new Date(data.collected_at).toLocaleString():'尚未采集'));
+ if(data.balance)lines.push('余额：'+data.balance.currency+' '+data.balance.amount);
+ if(data.stale)lines.push('余额已过期');
+ if(data.error)lines.push('采集结果：'+data.error);
+ statusBox.textContent=lines.join('\n');
+}
+async function request(path,body){
+ message.textContent='';
+ const key=managementKey.value.trim();
+ if(!key)throw new Error('请先输入 CPA 管理密钥。');
+ try{localStorage.setItem(storageKey,key);}catch{message.textContent='浏览器禁止本地存储，管理密钥仅用于本次请求。';}
+ const response=await fetch('/v0/management/plugins/ollama-quota/'+path,{method:body===undefined?'GET':'POST',headers:{Authorization:'Bearer '+key,'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),cache:'no-store',credentials:'omit',redirect:'error'});
+ if(!response.ok)throw new Error(response.status===401||response.status===403?'管理密钥无效或没有访问权限。':'请求失败（HTTP '+response.status+'）。');
+ render(await response.json());
+}
+async function run(action){
+ const buttons=Array.from(document.querySelectorAll('button'));buttons.forEach(b=>b.disabled=true);
+ try{await action();}catch(error){message.textContent=error.message==='Failed to fetch'?'连接失败，请检查 CPA 和网络后重试。':error.message;}
+ finally{buttons.forEach(b=>b.disabled=false);}
+}
+document.getElementById('connect').onclick=()=>run(()=>request('settings'));
+document.getElementById('refresh').onclick=()=>run(()=>request('refresh',{}));
+document.getElementById('forget').onclick=()=>{try{localStorage.removeItem(storageKey);}catch{}managementKey.value='';apiKey.value='';statusBox.textContent='已忘记管理密钥。';message.textContent='';};
+document.getElementById('settings').onsubmit=event=>{event.preventDefault();const key=apiKey.value.trim();if(!key)return;apiKey.value='';run(()=>request('settings',{api_key:key}));};
+if(managementKey.value)run(()=>request('settings'));
+</script>
+</html>
