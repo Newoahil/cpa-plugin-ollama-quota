@@ -263,11 +263,10 @@ mount_overlap_scan() {
   if ! ps_out="$(docker ps -q 2>"$WORKDIR/docker-ps.err")"; then
     mount_check_failure "docker ps -q failed: $(head -3 "$WORKDIR/docker-ps.err" 2>/dev/null | tr '\n' ' ')"
   fi
-  mapfile -t running_ids <<<"$ps_out"
-  running_ids=("${running_ids[@]/#/}")
-  local kept=()
-  for id in "${running_ids[@]}"; do [[ -n "$id" ]] && kept+=("$id"); done
-  running_ids=("${kept[@]}")
+  running_ids=()
+  while IFS= read -r id; do
+    [[ -n "$id" ]] && running_ids+=("$id")
+  done <<<"$ps_out"
 
   if [[ ${#running_ids[@]} -eq 0 ]]; then
     note "no running containers; the mount-overlap check does not apply"
