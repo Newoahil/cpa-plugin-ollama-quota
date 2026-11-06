@@ -875,7 +875,13 @@ func TestInFlightExecutionHoldsTheQuiesceBarrier(t *testing.T) {
 		done <- raw
 	}()
 
-	waitUntil(t, "the execution to reach the host", func() bool { return bridge.inflight.pending() > 0 })
+	// Wait for the executor's own host.http.do, not just any in-flight callback.
+	// The collector also makes one host call (its deliberately failing
+	// auth.list), and treating that short-lived call as the execution would let
+	// the barrier run during the gap before the executor reaches the host.
+	waitUntil(t, "the execution to reach the host", func() bool {
+		return host.requestCount() > 0 && bridge.inflight.pending() > 0
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()

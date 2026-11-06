@@ -123,9 +123,60 @@ R2 新目录/internal 网络/HTTPS fixture；取消、断流、空流分别使�
 
 R1 保留 5 个已停止容器、1 个 internal 网络；R2 保留 8 个已停止容器、1 个 internal 网络，以及两轮 run、tools、归档、原始日志/SSE/产物。本机还保留已退出的 Linux race 容器与忽略的 dist 证据。fixture stop 后 exit 2 如实保留，不写成全部退出码为零。清理需另行授权，按进度文件和资源清单的完整 ID/挂载归属逐项核实，禁止 prune。
 
+## T24：候选自身作为被替换方的修复与回归
+
+来源：`works 2026-11-06#T24`，基线为本分支起点 `96fdd75`（PR #21 head）。触发证据是 T21 验收报告 §3 与附录 B：40 token、1 token/s 的流在首事件后 PATCH 到字节相同的新目录，只收到 29/40 token，约 28.15–28.19s 以错误结束，缺 stop/usage/DONE；PID/StartedAt/restarts 不变；把 baseline 作为被替换方时同一路径收满 40 token。修复前本票用 60 token 流复现为 42/60，形状一致。
+
+### 根因
+
+宿主按插件 ID + SHA-256 给产物选 shadow 路径。`/plugins/a` 与 `/plugins/b` 字节相同时，宿主 dlopen 的是同一个库映射，于是对仍在服务的实例再调一次 `cliproxy_plugin_init`；旧实例没有被卸载，旧 generation 的异步 pump 仍在发事件。
+
+修复前 `cmd/plugin/main.go` 用包级 `stored_host` 保存最近一次 init 的宿主表。第二次 init 覆盖它之后，旧 pump 的 `host.stream.emit` / `host.http.stream_read` 走的是新客户端的 `host_ctx`。宿主 `cliproxyHostCall` 按 `host_ctx` 找回调实例，发现实例不匹配，返回 `host callback ID does not belong to the calling plugin instance`，流在体中断掉。Runtime 的“每 init 一个 generation”本来已经分代了 Handler/State/bridge，被覆盖的只有宿主表这一处全局状态。
+
+### 修复
+
+`cmd/plugin/main.go` 增加 `cliproxy_clone_host_api`：每次 init 在 C 侧 malloc 一份宿主表，`hostCallFor` 返回的闭包只调用自己那份。第二个 init 不再影响第一个 generation 的回调路由。
+
+这份拷贝刻意不释放：宿主自己的 loader 也无法知道常驻插件何时停用旧 `host_ctx`，同样选择不回收；退役 pump 可能一直用到最后一个事件。每次 init 一个小块，数量等于本进程内的 init 次数。
+
+只动 ABI shim。没有改 quiesce 预算、宿主卸载策略、依赖、版本号或额度逻辑；只使用宿主在 init 时交给插件的公开表，没有碰 `internal/`。
+
+### 回归：`scripts/verify-hotswap-same-artifact.sh`
+
+真机路径，不是单测：真实 `eceasy/cli-proxy-api:v8.0.47`（linux/amd64）容器，ollama 类型假凭据，HTTPS fixture 在 user-defined 网络里以 `ollama.com` 为别名提供 `/api/tags`、`/api/balance`、`/v1/chat/completions`，每秒发一个 token，共 60 个；CPA 容器设 `SSL_CERT_FILE` 信任 fixture CA，并先断言 `ollama.com` 在该网络里解析到 fixture，防止把假 key 发到真实域名。fixture 侧记录到 `host=ollama.com`、`auth_match=true` 的 chat 请求，证明请求确实经插件 executor 发往上游。
+
+同一产物字节从 `/plugins/a` 复制到 `/plugins/b`，`cmp -s` 断言相同，PATCH 只改插件目录。流进行到第 5 秒发起 PATCH，等宿主自己打出 hot reload 行后再收完整个流。
+
+断言：60/60 token 顺序完整、stop、usage `completion_tokens=60`、唯一 DONE、无 error 帧；重载后仍有 token 且请求跨越重载；fixture 收到首帧；宿主日志出现 `active_path=/plugins/b/` 的 hot reload 行和至少一条 `plugin quiesce failed`；请求总时长 >30s；PID/StartedAt/restarts 前后不变；0 error/fatal、无 panic。异步 pump 占着整段 in-flight 计数，5s drain + 5s inflight 屏障必然超预算，所以 quiesce 失败是预期行为，断言它反而证明替换确实撞上了在途流。PATCH 200 和 PID 不变在修复前同样成立，不作为通过条件。
+
+### 红绿证据
+
+同一台机器、同一脚本、同一镜像标签：
+
+| 代码 | 结果 |
+|---|---|
+| 修复前 `96fdd75`（`git archive` 隔离树） | **FAIL**：42/60 token；error 帧 `the Ollama execution failed`；宿主日志 `502 / 41.026s / upstream execution failed`；fixture 记录 `cancelled sent_tokens=42`；重载后 0 token；3 项断言失败 |
+| 修复后工作树 | **PASS**：60/60；重载时 37，之后 23；请求 60s；artifact SHA `d64d5686…f64cda`；PID 不变；1 条 quiesce 警告；0 error/fatal、无 panic |
+
+修复后时间线（UTC）：流 `09:47:39` 开始，PATCH `09:47:46`，quiesce 失败 `09:48:13`，hot reload `09:48:14`，流 `09:48:39` 完整结束。修复前：流 `09:50:48` 开始，PATCH `09:50:57`；宿主日志（本地时间 UTC+8）`17:51:24` 记录 quiesce 失败，`17:51:29` 完成重载并在同一秒报 502；fixture 在 `09:51:29.939` 记录 `cancelled sent_tokens=42`。
+
+修复前跑出的就是 F1 的形状（在途截断 + error 帧 + 宿主 502），说明脚本能抓到该缺陷，不是只对修复后的代码变绿。一次早期版本的脚本把模型接到 OpenAI-compat 上游，请求绕过了插件 executor，日志里没有 quiesce 警告；该版本已废弃，判定走插件的依据固定为 fixture 侧的 `chat` 记录。
+
+### 本机自测
+
+- 仅本票改动文件的 gofmt、`go build ./...`、`go vet ./...`、`ASSISTANT_NO_SEND=1 go test -race -count=1 ./...` 在 `quota-go:1.26-bookworm` 内 exit 0；ollama 2.462s，quotaplugin 172.342s。
+- 顺带修了一个既有单测 flake：`TestInFlightExecutionHoldsTheQuiesceBarrier` 原来只等 `bridge.inflight.pending() > 0`，采集器的失败回调可以先满足它；改为同时要求 `host.requestCount() > 0`。未改产品代码时 20 轮出现 2 次失败，修改后 50/50 通过。这是测试改动，列在这里便于复现。
+- 仓库现有三个与本票无关的文件不满足 gofmt（`internal/ollama/review2_test.go`、`internal/quotaplugin/management_settings.go`、`internal/quotaplugin/settings.go`），未动。
+
+### 平台边界
+
+- 本轮真机回归只在 Windows 的 Docker linux/amd64 上跑，镜像是真实 `eceasy/cli-proxy-api:v8.0.47`；T17/T21 的 Mac arm64 环境本轮未能再跑（2026-11-06 17:5x `ssh mac` 连接 `192.168.11.28:22` 超时）。C ABI 与宿主回调路由这条路径与架构无关，但不在本票宣称 arm64 已复验。
+- 上游仍是 HTTPS fixture，不是真实 Ollama Cloud 账号。不合并、不打 tag、不发布；版本仍 0.2.1。
+
 ## 未验与交接边界
 
 - 上游为 HTTPS fixture，不是实际 Ollama Cloud 账号；真实账号的推理与 AC-2 未验。
+- T24 的候选作为被替换方回归只在 linux/amd64 完成，Mac arm64 本轮未复跑；结论不外推到未验证的平台。
 - 不改版本号、tag、Release 或商店；版本仍 0.2.1，dev 内容与现有 tag 不同，正式发版需另定版本。
 - 不合并 PR，不删除资源、分支或会话。
 - 没有界面，不需要体验环境。
