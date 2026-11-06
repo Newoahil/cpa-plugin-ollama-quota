@@ -318,7 +318,7 @@ func TestExecuteMapsAnUpstreamRejection(t *testing.T) {
 }
 
 func TestExecuteStreamReturnsDataForHostFraming(t *testing.T) {
-	h, host := newExecutorHandler(t, map[string]any{"type": "ollama", "api_key": fixtureAPIKey})
+	h, host := newStreamExecutorHandler(t)
 	recorder := &requestRecorder{}
 	host.setRespond(func(request pluginapi.HTTPRequest) pluginapi.HTTPResponse {
 		recorder.record(request)
@@ -329,12 +329,7 @@ func TestExecuteStreamReturnsDataForHostFraming(t *testing.T) {
 		}
 	})
 
-	raw, err := h.Handle(pluginabi.MethodExecutorExecuteStream, executorRequestPayload(t, map[string]any{
-		"model":       "gpt-oss:120b",
-		"stream":      true,
-		"payload":     chatRequestBody(),
-		"StorageJSON": storageJSON(t, map[string]any{"type": "ollama", "api_key": fixtureAPIKey}),
-	}))
+	raw, err := h.Handle(pluginabi.MethodExecutorExecuteStream, streamPayload(t))
 	if err != nil {
 		t.Fatalf("executor.execute_stream: %v", err)
 	}
@@ -349,6 +344,7 @@ func TestExecuteStreamReturnsDataForHostFraming(t *testing.T) {
 	if response.Headers.Get("Content-Type") != "text/event-stream" {
 		t.Errorf("content type = %q", response.Headers.Get("Content-Type"))
 	}
+	response.Chunks = host.collect(t, response)
 	want := []string{`{"n":1}`, `{"n":2}`}
 	if len(response.Chunks) != len(want) {
 		t.Fatalf("got %d chunks, want %d: %q", len(response.Chunks), len(want), response.Chunks)
@@ -376,7 +372,7 @@ func TestExecuteStreamReturnsDataForHostFraming(t *testing.T) {
 }
 
 func TestExecuteStreamWrapsANonStreamingAnswer(t *testing.T) {
-	h, host := newExecutorHandler(t, map[string]any{"type": "ollama", "api_key": fixtureAPIKey})
+	h, host := newStreamExecutorHandler(t)
 	host.setRespond(func(pluginapi.HTTPRequest) pluginapi.HTTPResponse {
 		return pluginapi.HTTPResponse{
 			StatusCode: http.StatusOK,
@@ -385,11 +381,7 @@ func TestExecuteStreamWrapsANonStreamingAnswer(t *testing.T) {
 		}
 	})
 
-	raw, err := h.Handle(pluginabi.MethodExecutorExecuteStream, executorRequestPayload(t, map[string]any{
-		"model":       "gpt-oss:120b",
-		"payload":     chatRequestBody(),
-		"StorageJSON": storageJSON(t, map[string]any{"type": "ollama", "api_key": fixtureAPIKey}),
-	}))
+	raw, err := h.Handle(pluginabi.MethodExecutorExecuteStream, streamPayload(t))
 	if err != nil {
 		t.Fatalf("executor.execute_stream: %v", err)
 	}
@@ -401,6 +393,7 @@ func TestExecuteStreamWrapsANonStreamingAnswer(t *testing.T) {
 	if err := json.Unmarshal(envelope.Result, &response); err != nil {
 		t.Fatalf("decode stream response: %v", err)
 	}
+	response.Chunks = host.collect(t, response)
 	// The host frames this JSON and writes DONE when the channel closes; the
 	// plugin must supply neither the data: prefix nor its own sentinel.
 	if len(response.Chunks) != 1 {
@@ -505,7 +498,7 @@ func TestExecuteStreamRejectsEmptyData(t *testing.T) {
 		{"DONE only", "text/event-stream", "data: [DONE]\n\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			h, host := newExecutorHandler(t, map[string]any{"type": "ollama", "api_key": fixtureAPIKey})
+			h, host := newStreamExecutorHandler(t)
 			host.setRespond(func(pluginapi.HTTPRequest) pluginapi.HTTPResponse {
 				return pluginapi.HTTPResponse{
 					StatusCode: http.StatusOK,
@@ -513,11 +506,7 @@ func TestExecuteStreamRejectsEmptyData(t *testing.T) {
 					Body:       []byte(tc.body),
 				}
 			})
-			raw, err := h.Handle(pluginabi.MethodExecutorExecuteStream, executorRequestPayload(t, map[string]any{
-				"model":       "gpt-oss:120b",
-				"payload":     chatRequestBody(),
-				"StorageJSON": storageJSON(t, map[string]any{"type": "ollama", "api_key": fixtureAPIKey}),
-			}))
+			raw, err := h.Handle(pluginabi.MethodExecutorExecuteStream, streamPayload(t))
 			if err != nil {
 				t.Fatalf("executor.execute_stream: %v", err)
 			}
@@ -541,7 +530,7 @@ func TestExecuteStreamRejectsEmptyData(t *testing.T) {
 func TestExecuteStreamHostFramingPreservesContent(t *testing.T) {
 	for _, tokens := range []int{3, 40} {
 		t.Run(fmt.Sprintf("%d tokens", tokens), func(t *testing.T) {
-			h, host := newExecutorHandler(t, map[string]any{"type": "ollama", "api_key": fixtureAPIKey})
+			h, host := newStreamExecutorHandler(t)
 			var upstream, want strings.Builder
 			for i := 1; i <= tokens; i++ {
 				token := fmt.Sprintf("T%02d ", i)
@@ -557,11 +546,7 @@ func TestExecuteStreamHostFramingPreservesContent(t *testing.T) {
 					Body:       []byte(upstream.String()),
 				}
 			})
-			raw, err := h.Handle(pluginabi.MethodExecutorExecuteStream, executorRequestPayload(t, map[string]any{
-				"model":       "gpt-oss:120b",
-				"payload":     chatRequestBody(),
-				"StorageJSON": storageJSON(t, map[string]any{"type": "ollama", "api_key": fixtureAPIKey}),
-			}))
+			raw, err := h.Handle(pluginabi.MethodExecutorExecuteStream, streamPayload(t))
 			if err != nil {
 				t.Fatalf("executor.execute_stream: %v", err)
 			}
@@ -573,6 +558,7 @@ func TestExecuteStreamHostFramingPreservesContent(t *testing.T) {
 			if err := json.Unmarshal(envelope.Result, &response); err != nil {
 				t.Fatalf("decode stream response: %v", err)
 			}
+			response.Chunks = host.collect(t, response)
 			events := hostFramedEvents(t, response.Chunks)
 			if len(events) != tokens+2 {
 				t.Fatalf("got %d data events, want %d tokens + stop + usage", len(events), tokens)
