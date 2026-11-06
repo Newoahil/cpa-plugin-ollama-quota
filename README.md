@@ -304,17 +304,19 @@ QuotaFetchRequest.Metadata。沿用已有 CPA 凭证时，无需固定 auths 路
 
 已知取舍：
 
-- **流式不是逐字增量。** 插件把上游 SSE 整段读完再切成帧交给宿主（`executor.execute_stream`
-  同步返回 `chunks`），所以客户端拿到第一帧的时间等于整段生成结束的时间。这是当前宿主协议里
-  同步返回这条路线的形态；要做真增量得走 `host.stream.emit` 异步通道，留作后续。
-  **注意**：回答很长、上游生成时间超过 CPA 或客户端对首字节的空闲超时时，这条会表现为请求
-  直接失败，而不只是「首字慢」。真要长回答流式，这一条得先解决。
+- **流式逐事件增量输出。** 插件通过 `host.http.do_stream` / `host.http.stream_read` 读取上游，
+  收到首个完整有效事件即向宿主返回异步流，后续事件通过 `host.stream.emit` 逐个交出，不再等待全文结束。
+  SDK Payload 只含裸 JSON；宿主统一封装单层 SSE，并在正常关闭后写唯一的 `[DONE]`。
+  任意网络分片、CRLF、多行 data 字段都会先组为完整事件，token、stop、usage 顺序不变。
+  空流在返回异步成功前仍报 HTTP 502；中途断开则关闭流并报告错误，客户端取消会传递到上游。
+  仍保留总响应 32 MiB 上限；上游若忽略 stream 返回普通 JSON，只能在完整 JSON 到达后回退为一个事件。
 - **`executor.count_tokens` 直接返回 501。** Ollama 没有 token 计数接口，猜一个数会违反
   「宁缺毋错」（SPEC 4.3），宿主会回落到自己的估算器。
 - **`executor.http_request` 只转发到 `https://ollama.com`。** 其它域一律 400，凭证不会被带到
   别家域名。
 - **热替换不取消在途推理。** SPEC 4.1 要求在途请求跑完，所以执行调用不登记在 `Provider.Track`
-  里；宿主会等它结束，超过 quiesce 的有界预算时如实返回 `quiesce_drain_timeout`。
+  里；异步流从 HTTP 预检到最终关闭的整个生命周期计入宿主桥的 in-flight 屏障，而不是只统计瞬时回调。
+  超过 quiesce 的有界预算时仍如实返回 `quiesce_drain_timeout`，没有放宽或改变原有卸载策略。
 
 ## 文档
 
