@@ -27,11 +27,17 @@ type Envelope struct {
 
 // EnvelopeError reports a failed call. Message must never contain credential
 // material.
+//
+// HTTPStatus is what the host turns into an rpcError's StatusCode
+// (internal/pluginhost/rpc_client.go:371), which is how a client sees Ollama's
+// 429 or a rejected key as itself instead of a generic 502. It is omitted when
+// zero, so the quota envelopes keep their existing shape.
 type EnvelopeError struct {
-	Code      string         `json:"code"`
-	Message   string         `json:"message"`
-	Retryable bool           `json:"retryable,omitempty"`
-	Detail    map[string]any `json:"detail,omitempty"`
+	Code       string         `json:"code"`
+	Message    string         `json:"message"`
+	Retryable  bool           `json:"retryable,omitempty"`
+	HTTPStatus int            `json:"http_status,omitempty"`
+	Detail     map[string]any `json:"detail,omitempty"`
 }
 
 // IdentifierResponse is the shape the host decodes for *.identifier methods.
@@ -59,7 +65,7 @@ type quotaFetchRequest struct {
 }
 
 // Registration mirrors the host's rpcRegistration schema. The plugin exposes
-// quota collection and its configuration page, without changing inference routes.
+// quota collection, its configuration page, and Ollama inference.
 type Registration struct {
 	SchemaVersion uint32              `json:"schema_version"`
 	Metadata      pluginapi.Metadata  `json:"metadata"`
@@ -68,9 +74,40 @@ type Registration struct {
 
 // RegistrationCapable lists the capability flags the host understands. Every
 // other flag is left at its zero value.
+//
+// Three capabilities are declared together and they only make sense as a set:
+//
+//   - Executor registers this plugin as the inference provider for "ollama",
+//     which is what turns a file auth into a usable one;
+//   - ModelProvider supplies the per-credential model list through
+//     model.for_auth, since there is no static catalog to declare;
+//   - QuotaProvider is the original capability, unchanged.
+//
+// ExecutorModelScope is "both": the host registers static models from this
+// plugin when it declares any (it does not) and per-auth models for OAuth-style
+// credentials, which is the path a file auth with an API key takes.
 type RegistrationCapable struct {
-	QuotaProvider bool `json:"quota_provider"`
-	ManagementAPI bool `json:"management_api"`
+	QuotaProvider         bool                         `json:"quota_provider"`
+	ManagementAPI         bool                         `json:"management_api"`
+	ModelProvider         bool                         `json:"model_provider"`
+	Executor              bool                         `json:"executor"`
+	ExecutorModelScope    pluginapi.ExecutorModelScope `json:"executor_model_scope"`
+	ExecutorInputFormats  []string                     `json:"executor_input_formats,omitempty"`
+	ExecutorOutputFormats []string                     `json:"executor_output_formats,omitempty"`
+}
+
+// registeredCapabilities is the single declaration the register handler uses, so
+// a test can assert the exact set the host is told about.
+func registeredCapabilities() RegistrationCapable {
+	return RegistrationCapable{
+		QuotaProvider:         true,
+		ManagementAPI:         true,
+		ModelProvider:         true,
+		Executor:              true,
+		ExecutorModelScope:    pluginapi.ExecutorModelScopeBoth,
+		ExecutorInputFormats:  []string{formatChatCompletions},
+		ExecutorOutputFormats: []string{formatChatCompletions},
+	}
 }
 
 // Handler dispatches RPC methods against one plugin instance.
@@ -130,6 +167,20 @@ func (h *Handler) Handle(method string, request []byte) ([]byte, error) {
 		return h.handleFetch(request)
 	case pluginabi.MethodQuotaReset:
 		return h.handleReset(request)
+	case pluginabi.MethodExecutorIdentifier:
+		return h.handleExecutorIdentifier(request)
+	case pluginabi.MethodExecutorExecute:
+		return h.handleExecutorExecute(request)
+	case pluginabi.MethodExecutorExecuteStream:
+		return h.handleExecutorExecuteStream(request)
+	case pluginabi.MethodExecutorCountTokens:
+		return h.handleExecutorCountTokens(request)
+	case pluginabi.MethodExecutorHTTPRequest:
+		return h.handleExecutorHTTPRequest(request)
+	case pluginabi.MethodModelStatic:
+		return h.handleModelStatic(request)
+	case pluginabi.MethodModelForAuth:
+		return h.handleModelForAuth(request)
 	case pluginabi.MethodManagementRegister:
 		return OKEnvelope(managementRegistration())
 	case pluginabi.MethodManagementHandle:
@@ -182,7 +233,7 @@ func (h *Handler) handleRegister(raw []byte) ([]byte, error) {
 	reg := Registration{
 		SchemaVersion: SchemaVersion,
 		Metadata:      metadata(cfg),
-		Capabilities:  RegistrationCapable{QuotaProvider: true, ManagementAPI: true},
+		Capabilities:  registeredCapabilities(),
 	}
 	if errConfig != nil {
 		// Keep the plugin loadable: the host drops a registration that

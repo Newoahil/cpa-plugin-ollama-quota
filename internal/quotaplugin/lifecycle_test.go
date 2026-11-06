@@ -153,7 +153,10 @@ func TestQuiesceCancelsInFlightFetch(t *testing.T) {
 }
 
 func TestUnknownMethodIsReportedAsUnsupported(t *testing.T) {
-	raw, err := newHandlerForTest(t).Handle("executor.execute", nil)
+	// A method this plugin genuinely does not implement. The executor methods
+	// used to stand in here; they are served since 0.2.0 (see executor_test.go),
+	// so the probe is an invented name rather than a real one.
+	raw, err := newHandlerForTest(t).Handle("plugin.no.such.method", nil)
 	if err != nil {
 		t.Fatalf("unknown method: %v", err)
 	}
