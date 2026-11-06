@@ -493,6 +493,51 @@ func TestSSEFramesReturnsOnlyEventData(t *testing.T) {
 	}
 }
 
+func TestExecuteStreamRejectsEmptyData(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		contentType string
+		body        string
+	}{
+		{"empty event stream", "text/event-stream", ""},
+		{"empty JSON response", "application/json", ""},
+		{"comments only", "text/event-stream", ": heartbeat\n\n"},
+		{"DONE only", "text/event-stream", "data: [DONE]\n\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, host := newExecutorHandler(t, map[string]any{"type": "ollama", "api_key": fixtureAPIKey})
+			host.setRespond(func(pluginapi.HTTPRequest) pluginapi.HTTPResponse {
+				return pluginapi.HTTPResponse{
+					StatusCode: http.StatusOK,
+					Headers:    http.Header{"Content-Type": []string{tc.contentType}},
+					Body:       []byte(tc.body),
+				}
+			})
+			raw, err := h.Handle(pluginabi.MethodExecutorExecuteStream, executorRequestPayload(t, map[string]any{
+				"model":       "gpt-oss:120b",
+				"payload":     chatRequestBody(),
+				"StorageJSON": storageJSON(t, map[string]any{"type": "ollama", "api_key": fixtureAPIKey}),
+			}))
+			if err != nil {
+				t.Fatalf("executor.execute_stream: %v", err)
+			}
+			envelope := decodeEnvelope(t, raw)
+			if envelope.OK || envelope.Error == nil {
+				t.Fatalf("empty upstream data returned a successful chunk list; want upstream_invalid_response / 502: %s", raw)
+			}
+			if envelope.Error.Code != "upstream_invalid_response" || envelope.Error.HTTPStatus != http.StatusBadGateway {
+				t.Errorf("error = %+v, want upstream_invalid_response / 502", envelope.Error)
+			}
+			if envelope.Error.Message != "the Ollama upstream sent a response this plugin could not read" {
+				t.Errorf("message = %q, want the existing parse-failure message", envelope.Error.Message)
+			}
+			if strings.Contains(string(raw), fixtureAPIKey) {
+				t.Error("the error response contains the credential")
+			}
+		})
+	}
+}
+
 func TestExecuteStreamHostFramingPreservesContent(t *testing.T) {
 	for _, tokens := range []int{3, 40} {
 		t.Run(fmt.Sprintf("%d tokens", tokens), func(t *testing.T) {

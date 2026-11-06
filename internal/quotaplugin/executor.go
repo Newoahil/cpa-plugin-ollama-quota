@@ -260,9 +260,15 @@ func (h *Handler) handleExecutorExecuteStream(raw []byte) ([]byte, error) {
 		return upstreamFailure(response, credential), nil
 	}
 
+	chunks := sseFrames(response.body, response.isEventStream())
+	if len(chunks) == 0 {
+		// An empty chunk list selects the host's async emit protocol, which
+		// this synchronous executor does not implement. Fail rather than hang.
+		return executorFailure(ollama.ErrParse, credential), nil
+	}
 	return OKEnvelope(executorStreamResponse{
 		Headers: http.Header{"Content-Type": []string{"text/event-stream"}},
-		Chunks:  sseFrames(response.body, response.isEventStream()),
+		Chunks:  chunks,
 	})
 }
 
