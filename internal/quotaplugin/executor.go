@@ -65,9 +65,6 @@ const (
 
 	// maxUpstreamMessageLength caps the upstream text quoted into an error.
 	maxUpstreamMessageLength = 240
-
-	// sseDoneFrame terminates an OpenAI-format event stream.
-	sseDoneFrame = "data: [DONE]\n\n"
 )
 
 // ErrExecutorUnavailable reports an executor call that arrived while the plugin
@@ -229,7 +226,7 @@ func (h *Handler) handleExecutorExecute(raw []byte) ([]byte, error) {
 
 // handleExecutorExecuteStream forwards one streaming chat completion.
 //
-// The upstream body is read in full and split into SSE frames here, then handed
+// The upstream body is read in full and split into event data here, then handed
 // back as ready-made chunks. That is the synchronous half of the plugin stream
 // protocol (see rpc_client_stream.go:29: a non-empty chunk list is returned as a
 // closed channel). The trade-off is described in the README's 推理 section: no
@@ -550,44 +547,43 @@ func responseHeaders(source http.Header) http.Header {
 // Streaming
 // ---------------------------------------------------------------------------
 
-// sseFrames turns an upstream stream body into the chunks the host forwards.
+// sseFrames extracts event data for the declared chat-completions output format.
+// The host adds the SSE data: wrapper and writes DONE when the chunk channel
+// closes. Supplying either here would double-frame the data or the sentinel.
+// Non-data fields (including comments) do not belong in a JSON payload.
 //
-// The body is kept frame-for-frame, with exactly one terminating `data: [DONE]`
-// frame added at the end when the upstream sent none: the host only appends its
-// own DONE on the response-translation path (adapters_executors.go:627), so a
-// client waiting for the sentinel would otherwise never see it.
-//
-// A 200 that is not an event stream is wrapped as a single data frame. Ollama
-// answers `stream: true` with SSE, but a proxy in front of it may collapse the
-// body to one JSON object, and the client would then wait forever for a frame
-// boundary that never arrives.
+// A non-event-stream JSON answer is supplied as one payload, also without an
+// SSE wrapper. The synchronous, whole-response buffering is unchanged.
 func sseFrames(body []byte, eventStream bool) []pluginapi.ExecutorStreamChunk {
-	frames := make([][]byte, 0, 8)
+	payloads := make([][]byte, 0, 8)
 	if eventStream {
 		for _, frame := range splitSSE(body) {
-			if isDoneFrame(frame) {
+			payload := sseData(frame)
+			trimmed := bytes.TrimSpace(payload)
+			if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("[DONE]")) {
 				continue
 			}
-			frames = append(frames, frame)
+			payloads = append(payloads, payload)
 		}
 	} else if trimmed := bytes.TrimSpace(body); len(trimmed) > 0 && json.Valid(trimmed) {
-		frame := make([]byte, 0, len(trimmed)+8)
-		frame = append(frame, "data: "...)
-		frame = append(frame, trimmed...)
-		frame = append(frame, '\n', '\n')
-		frames = append(frames, frame)
+		payloads = append(payloads, trimmed)
 	}
-	frames = append(frames, []byte(sseDoneFrame))
 
-	chunks := make([]pluginapi.ExecutorStreamChunk, 0, len(frames))
-	for _, frame := range frames {
-		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: frame})
+	chunks := make([]pluginapi.ExecutorStreamChunk, 0, len(payloads))
+	for _, payload := range payloads {
+		// Multiple SSE data fields are joined by newlines. Compact valid JSON
+		// so the host's single data: field remains one physical line; JSON
+		// string contents (including escaped newlines) retain their meaning.
+		var compact bytes.Buffer
+		if errCompact := json.Compact(&compact, payload); errCompact == nil {
+			payload = compact.Bytes()
+		}
+		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: payload})
 	}
 	return chunks
 }
 
-// splitSSE cuts a body into complete event frames, normalising line endings to
-// the "\n\n" the host's forwarders expect.
+// splitSSE cuts an upstream body into complete event frames, normalising CRLF.
 func splitSSE(body []byte) [][]byte {
 	var frames [][]byte
 	pending := make([]byte, 0, 512)
@@ -616,16 +612,17 @@ func splitSSE(body []byte) [][]byte {
 	return frames
 }
 
-// isDoneFrame reports an OpenAI sentinel frame, which sseFrames re-emits exactly
-// once at the end.
-func isDoneFrame(frame []byte) bool {
-	for _, line := range strings.Split(string(frame), "\n") {
-		line = strings.ReplaceAll(strings.TrimSpace(line), " ", "")
-		if line == "data:[DONE]" {
-			return true
+// sseData joins only data fields, removing the one optional space after ':'.
+// Comments and event/id/retry fields are SSE metadata, not response JSON.
+func sseData(frame []byte) []byte {
+	var data [][]byte
+	for _, line := range bytes.Split(frame, []byte("\n")) {
+		field, value, _ := bytes.Cut(line, []byte(":"))
+		if bytes.Equal(field, []byte("data")) {
+			data = append(data, bytes.TrimPrefix(value, []byte(" ")))
 		}
 	}
-	return false
+	return bytes.Join(data, []byte("\n"))
 }
 
 // ---------------------------------------------------------------------------

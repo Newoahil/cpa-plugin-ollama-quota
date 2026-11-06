@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -316,7 +317,7 @@ func TestExecuteMapsAnUpstreamRejection(t *testing.T) {
 	}
 }
 
-func TestExecuteStreamSplitsFramesAndEndsWithDone(t *testing.T) {
+func TestExecuteStreamReturnsDataForHostFraming(t *testing.T) {
 	h, host := newExecutorHandler(t, map[string]any{"type": "ollama", "api_key": fixtureAPIKey})
 	recorder := &requestRecorder{}
 	host.setRespond(func(request pluginapi.HTTPRequest) pluginapi.HTTPResponse {
@@ -348,7 +349,7 @@ func TestExecuteStreamSplitsFramesAndEndsWithDone(t *testing.T) {
 	if response.Headers.Get("Content-Type") != "text/event-stream" {
 		t.Errorf("content type = %q", response.Headers.Get("Content-Type"))
 	}
-	want := []string{"data: {\"n\":1}\n\n", "data: {\"n\":2}\n\n", sseDoneFrame}
+	want := []string{`{"n":1}`, `{"n":2}`}
 	if len(response.Chunks) != len(want) {
 		t.Fatalf("got %d chunks, want %d: %q", len(response.Chunks), len(want), response.Chunks)
 	}
@@ -400,13 +401,175 @@ func TestExecuteStreamWrapsANonStreamingAnswer(t *testing.T) {
 	if err := json.Unmarshal(envelope.Result, &response); err != nil {
 		t.Fatalf("decode stream response: %v", err)
 	}
-	// Without a frame boundary the client would wait forever, so a JSON answer
-	// is wrapped as one data frame plus the sentinel.
-	if len(response.Chunks) != 2 {
-		t.Fatalf("got %d chunks, want 2: %q", len(response.Chunks), response.Chunks)
+	// The host frames this JSON and writes DONE when the channel closes; the
+	// plugin must supply neither the data: prefix nor its own sentinel.
+	if len(response.Chunks) != 1 {
+		t.Fatalf("got %d chunks, want 1: %q", len(response.Chunks), response.Chunks)
 	}
-	if string(response.Chunks[0].Payload) != "data: {\"choices\":[]}\n\n" {
+	if string(response.Chunks[0].Payload) != `{"choices":[]}` {
 		t.Errorf("chunk 0 = %q", response.Chunks[0].Payload)
+	}
+	hostFramedEvents(t, response.Chunks)
+}
+
+// hostFramedEvents mirrors the public OpenAI handler's transport boundary:
+// WriteChunk adds data: and WriteDone adds the sole sentinel. Parse only one
+// layer of SSE fields, exactly as a standard client does, not a second prefix
+// to work around the T10 defect.
+func hostFramedEvents(t *testing.T, chunks []pluginapi.ExecutorStreamChunk) []json.RawMessage {
+	t.Helper()
+	var wire strings.Builder
+	for _, chunk := range chunks {
+		_, _ = fmt.Fprintf(&wire, "data: %s\n\n", chunk.Payload)
+	}
+	wire.WriteString("data: [DONE]\n\n")
+
+	var events []json.RawMessage
+	done := 0
+	for _, frame := range strings.Split(wire.String(), "\n\n") {
+		var data []string
+		for _, line := range strings.Split(frame, "\n") {
+			if value, ok := strings.CutPrefix(line, "data:"); ok {
+				data = append(data, strings.TrimPrefix(value, " "))
+			}
+		}
+		if len(data) == 0 {
+			continue
+		}
+		payload := strings.Join(data, "\n")
+		if payload == "[DONE]" {
+			done++
+			continue
+		}
+		if done > 0 {
+			t.Fatal("host-framed stream contains data after DONE")
+		}
+		if !json.Valid([]byte(payload)) {
+			t.Fatalf("host-framed event is not JSON after removing one SSE prefix: %q", payload)
+		}
+		events = append(events, json.RawMessage(payload))
+	}
+	if done != 1 {
+		t.Errorf("host-framed stream has %d DONE events, want exactly 1", done)
+	}
+	return events
+}
+
+func TestSSEFramesReturnsOnlyEventData(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		body        string
+		eventStream bool
+		want        []string
+	}{
+		{"upstream DONE", "data: {\"n\":1}\n\ndata: {\"n\":2}\n\ndata: [DONE]\n\n", true, []string{`{"n":1}`, `{"n":2}`}},
+		{"no upstream DONE", "data: {\"n\":1}\n\n", true, []string{`{"n":1}`}},
+		{"duplicate upstream DONE", "data: {\"n\":1}\n\ndata: [DONE]\n\ndata:[DONE]\n\n", true, []string{`{"n":1}`}},
+		{"CRLF and metadata", ": heartbeat\r\n\r\nevent: message\r\nid: 1\r\nretry: 1000\r\ndata:{\"n\":1}\r\n\r\ndata: [DONE]\r\n\r\n", true, []string{`{"n":1}`}},
+		{"multiple data lines", "data: {\"n\":\ndata: 1}\n\n", true, []string{`{"n":1}`}},
+		{"last frame without separator", "data: {\"n\":1}", true, []string{`{"n":1}`}},
+		{"literal prefix and sentinel in content", "data: {\"content\":\"data: [DONE] 雪\"}\n\n", true, []string{`{"content":"data: [DONE] 雪"}`}},
+		{"empty and non-data events", ": heartbeat\n\nevent: ping\nid: 1\n\ndata:\n\ndata\n\n", true, nil},
+		{"only DONE", "data: [DONE]\n\n", true, nil},
+		{"JSON fallback", `{"choices":[]}`, false, []string{`{"choices":[]}`}},
+		{"multiline JSON fallback", " {\n  \"choices\": []\n}\n", false, []string{`{"choices":[]}`}},
+		{"invalid JSON fallback", "not JSON", false, nil},
+		{"empty JSON fallback", "", false, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			chunks := sseFrames([]byte(tc.body), tc.eventStream)
+			// Check the client-facing boundary as well as the raw SDK payload;
+			// complete SSE frames used to pass the old unit tests but fail here.
+			events := hostFramedEvents(t, chunks)
+			if len(chunks) != len(tc.want) || len(events) != len(tc.want) {
+				t.Fatalf("got %d chunks / %d events, want %d", len(chunks), len(events), len(tc.want))
+			}
+			for i, want := range tc.want {
+				if string(chunks[i].Payload) != want || string(events[i]) != want {
+					t.Errorf("event %d: chunk=%q, client=%q, want %q", i, chunks[i].Payload, events[i], want)
+				}
+			}
+		})
+	}
+}
+
+func TestExecuteStreamHostFramingPreservesContent(t *testing.T) {
+	for _, tokens := range []int{3, 40} {
+		t.Run(fmt.Sprintf("%d tokens", tokens), func(t *testing.T) {
+			h, host := newExecutorHandler(t, map[string]any{"type": "ollama", "api_key": fixtureAPIKey})
+			var upstream, want strings.Builder
+			for i := 1; i <= tokens; i++ {
+				token := fmt.Sprintf("T%02d ", i)
+				want.WriteString(token)
+				_, _ = fmt.Fprintf(&upstream, "data: {\"choices\":[{\"delta\":{\"content\":%q},\"finish_reason\":null}]}\n\n", token)
+			}
+			upstream.WriteString("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+			_, _ = fmt.Fprintf(&upstream, "data: {\"choices\":[],\"usage\":{\"completion_tokens\":%d}}\n\ndata: [DONE]\n\n", tokens)
+			host.setRespond(func(pluginapi.HTTPRequest) pluginapi.HTTPResponse {
+				return pluginapi.HTTPResponse{
+					StatusCode: http.StatusOK,
+					Headers:    http.Header{"Content-Type": []string{"text/event-stream"}},
+					Body:       []byte(upstream.String()),
+				}
+			})
+			raw, err := h.Handle(pluginabi.MethodExecutorExecuteStream, executorRequestPayload(t, map[string]any{
+				"model":       "gpt-oss:120b",
+				"payload":     chatRequestBody(),
+				"StorageJSON": storageJSON(t, map[string]any{"type": "ollama", "api_key": fixtureAPIKey}),
+			}))
+			if err != nil {
+				t.Fatalf("executor.execute_stream: %v", err)
+			}
+			envelope := decodeEnvelope(t, raw)
+			if !envelope.OK {
+				t.Fatalf("executor.execute_stream failed: %+v", envelope.Error)
+			}
+			var response executorStreamResponse
+			if err := json.Unmarshal(envelope.Result, &response); err != nil {
+				t.Fatalf("decode stream response: %v", err)
+			}
+			events := hostFramedEvents(t, response.Chunks)
+			if len(events) != tokens+2 {
+				t.Fatalf("got %d data events, want %d tokens + stop + usage", len(events), tokens)
+			}
+			var content strings.Builder
+			for i, event := range events {
+				var chunk struct {
+					Choices []struct {
+						Delta struct {
+							Content string `json:"content"`
+						} `json:"delta"`
+						FinishReason *string `json:"finish_reason"`
+					} `json:"choices"`
+					Usage *struct {
+						CompletionTokens int `json:"completion_tokens"`
+					} `json:"usage"`
+				}
+				if err := json.Unmarshal(event, &chunk); err != nil {
+					t.Fatalf("decode event %d: %v", i, err)
+				}
+				if i <= tokens {
+					if len(chunk.Choices) != 1 {
+						t.Fatalf("event %d has %d choices, want 1", i, len(chunk.Choices))
+					}
+					content.WriteString(chunk.Choices[0].Delta.Content)
+					if i < tokens && (chunk.Choices[0].Delta.Content != fmt.Sprintf("T%02d ", i+1) || chunk.Choices[0].FinishReason != nil) {
+						t.Errorf("token event %d is out of order or has a premature finish", i)
+					}
+					if i == tokens && (chunk.Choices[0].FinishReason == nil || *chunk.Choices[0].FinishReason != "stop") {
+						t.Error("stop event missing or out of order")
+					}
+				} else if len(chunk.Choices) != 0 || chunk.Usage == nil || chunk.Usage.CompletionTokens != tokens {
+					t.Error("final usage missing, wrong or out of order")
+				}
+			}
+			if content.String() != want.String() {
+				t.Errorf("client content = %q, want every token once in order: %q", content.String(), want.String())
+			}
+			if strings.Contains(string(raw), fixtureAPIKey) {
+				t.Error("the stream response envelope contains the credential")
+			}
+		})
 	}
 }
 
