@@ -96,10 +96,9 @@ type executorHTTPRequest struct {
 	HostCallbackID string `json:"host_callback_id,omitempty"`
 }
 
-// executorStreamResponse is the wire shape of a streaming result. The host
-// decodes exactly these two fields (rpc_schema.go:55); chunks that are present
-// are handed back to the client as a closed channel, so this plugin can answer
-// a stream synchronously without the older host.stream.emit protocol.
+// executorStreamResponse is the streaming RPC response. An empty chunk list
+// selects the host.stream.emit channel; the host keeps its callback scope open
+// until host.stream.close or client cancellation.
 type executorStreamResponse struct {
 	Headers http.Header                     `json:"headers,omitempty"`
 	Chunks  []pluginapi.ExecutorStreamChunk `json:"chunks"`
@@ -224,16 +223,10 @@ func (h *Handler) handleExecutorExecute(raw []byte) ([]byte, error) {
 	})
 }
 
-// handleExecutorExecuteStream forwards one streaming chat completion.
-//
-// The upstream body is read in full and split into event data here, then handed
-// back as ready-made chunks. That is the synchronous half of the plugin stream
-// protocol (see rpc_client_stream.go:29: a non-empty chunk list is returned as a
-// closed channel). The trade-off is described in the README's 推理 section: no
-// incremental delivery, so the client sees the first frame after the whole
-// generation finishes. It is the version of streaming this SDK version can do
-// without the older host.stream.emit side channel, and it keeps the credential
-// handling in one place.
+// handleExecutorExecuteStream opens streaming HTTP and confirms the first event
+// before returning an async response. Empty streams and pre-stream HTTP errors
+// therefore keep their existing status; subsequent events are emitted as they
+// arrive, without waiting for upstream EOF.
 func (h *Handler) handleExecutorExecuteStream(raw []byte) ([]byte, error) {
 	target, refusal := h.executorTarget()
 	if refusal != nil {
@@ -252,24 +245,10 @@ func (h *Handler) handleExecutorExecuteStream(raw []byte) ([]byte, error) {
 		return ErrorEnvelope("invalid_request", errPayload.Error()), nil
 	}
 
-	response, errCall := target.post(h.ctx, chatCompletionsURL, credential, body, true, req.HostCallbackID)
-	if errCall != nil {
-		return executorFailure(errCall, credential), nil
+	if strings.TrimSpace(req.StreamID) == "" || strings.TrimSpace(req.HostCallbackID) == "" {
+		return errorEnvelopeStatus("invalid_request", "the executor stream requires host stream and callback IDs", http.StatusBadRequest), nil
 	}
-	if response.status != http.StatusOK {
-		return upstreamFailure(response, credential), nil
-	}
-
-	chunks := sseFrames(response.body, response.isEventStream())
-	if len(chunks) == 0 {
-		// An empty chunk list selects the host's async emit protocol, which
-		// this synchronous executor does not implement. Fail rather than hang.
-		return executorFailure(ollama.ErrParse, credential), nil
-	}
-	return OKEnvelope(executorStreamResponse{
-		Headers: http.Header{"Content-Type": []string{"text/event-stream"}},
-		Chunks:  chunks,
-	})
+	return h.startExecutorStream(target, req, credential, body)
 }
 
 // handleExecutorCountTokens refuses.
@@ -547,88 +526,6 @@ func responseHeaders(source http.Header) http.Header {
 		headers[key] = append([]string(nil), values...)
 	}
 	return headers
-}
-
-// ---------------------------------------------------------------------------
-// Streaming
-// ---------------------------------------------------------------------------
-
-// sseFrames extracts event data for the declared chat-completions output format.
-// The host adds the SSE data: wrapper and writes DONE when the chunk channel
-// closes. Supplying either here would double-frame the data or the sentinel.
-// Non-data fields (including comments) do not belong in a JSON payload.
-//
-// A non-event-stream JSON answer is supplied as one payload, also without an
-// SSE wrapper. The synchronous, whole-response buffering is unchanged.
-func sseFrames(body []byte, eventStream bool) []pluginapi.ExecutorStreamChunk {
-	payloads := make([][]byte, 0, 8)
-	if eventStream {
-		for _, frame := range splitSSE(body) {
-			payload := sseData(frame)
-			trimmed := bytes.TrimSpace(payload)
-			if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("[DONE]")) {
-				continue
-			}
-			payloads = append(payloads, payload)
-		}
-	} else if trimmed := bytes.TrimSpace(body); len(trimmed) > 0 && json.Valid(trimmed) {
-		payloads = append(payloads, trimmed)
-	}
-
-	chunks := make([]pluginapi.ExecutorStreamChunk, 0, len(payloads))
-	for _, payload := range payloads {
-		// Multiple SSE data fields are joined by newlines. Compact valid JSON
-		// so the host's single data: field remains one physical line; JSON
-		// string contents (including escaped newlines) retain their meaning.
-		var compact bytes.Buffer
-		if errCompact := json.Compact(&compact, payload); errCompact == nil {
-			payload = compact.Bytes()
-		}
-		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: payload})
-	}
-	return chunks
-}
-
-// splitSSE cuts an upstream body into complete event frames, normalising CRLF.
-func splitSSE(body []byte) [][]byte {
-	var frames [][]byte
-	pending := make([]byte, 0, 512)
-	flush := func() {
-		if len(pending) == 0 {
-			return
-		}
-		frame := make([]byte, 0, len(pending)+2)
-		frame = append(frame, pending...)
-		frame = append(frame, '\n', '\n')
-		frames = append(frames, frame)
-		pending = pending[:0]
-	}
-	for _, line := range bytes.Split(body, []byte("\n")) {
-		line = bytes.TrimSuffix(line, []byte("\r"))
-		if len(bytes.TrimSpace(line)) == 0 {
-			flush()
-			continue
-		}
-		if len(pending) > 0 {
-			pending = append(pending, '\n')
-		}
-		pending = append(pending, line...)
-	}
-	flush()
-	return frames
-}
-
-// sseData joins only data fields, removing the one optional space after ':'.
-// Comments and event/id/retry fields are SSE metadata, not response JSON.
-func sseData(frame []byte) []byte {
-	var data [][]byte
-	for _, line := range bytes.Split(frame, []byte("\n")) {
-		field, value, _ := bytes.Cut(line, []byte(":"))
-		if bytes.Equal(field, []byte("data")) {
-			data = append(data, bytes.TrimPrefix(value, []byte(" ")))
-		}
-	}
-	return bytes.Join(data, []byte("\n"))
 }
 
 // ---------------------------------------------------------------------------

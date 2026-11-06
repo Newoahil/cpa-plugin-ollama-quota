@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -14,6 +15,20 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
+
+// sseFrames keeps the original T13 table on the production incremental parser.
+// Only tests collect a whole answer; the executor itself never uses this helper.
+func sseFrames(body []byte, eventStream bool) []pluginapi.ExecutorStreamChunk {
+	reader := newEventReader(strings.NewReader(string(body)), eventStream)
+	var chunks []pluginapi.ExecutorStreamChunk
+	for {
+		payload, err := reader.next()
+		if err != nil {
+			return chunks
+		}
+		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: payload})
+	}
+}
 
 // streamTestHost models the two independent streams in the native ABI. HTTP
 // reads are arbitrary byte fragments, NOT SSE events; executor emits are event
@@ -174,7 +189,7 @@ func (f *streamTestHost) collect(t *testing.T, response executorStreamResponse) 
 	}
 }
 
-func (f *streamTestHost) assertClosed(t *testing.T, wantError bool) {
+func (f *streamTestHost) assertClosed(t *testing.T, wantStatus int) {
 	t.Helper()
 	select {
 	case <-f.closed:
@@ -183,11 +198,17 @@ func (f *streamTestHost) assertClosed(t *testing.T, wantError bool) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if (f.closeErr != nil) != wantError {
-		t.Errorf("stream close error = %+v, wantError=%v", f.closeErr, wantError)
+	if (f.closeErr != nil) != (wantStatus != 0) {
+		t.Errorf("stream close error = %+v, wantStatus=%d", f.closeErr, wantStatus)
 	}
-	if f.closeErr != nil && (strings.Contains(f.closeErr.Message, fixtureAPIKey) || f.closeErr.HTTPStatus != http.StatusBadGateway) {
-		t.Errorf("stream error leaked credential or lost upstream status: %+v", f.closeErr)
+	if f.closeErr != nil {
+		wantCode := "upstream_unreachable"
+		if wantStatus == http.StatusServiceUnavailable {
+			wantCode = "host_unavailable"
+		}
+		if strings.Contains(f.closeErr.Message, fixtureAPIKey) || f.closeErr.HTTPStatus != wantStatus || f.closeErr.Code != wantCode {
+			t.Errorf("stream error leaked credential or lost classification: %+v", f.closeErr)
+		}
 	}
 	if f.upClosed != 1 {
 		t.Errorf("upstream stream closed %d times, want exactly once", f.upClosed)
@@ -261,7 +282,7 @@ func TestExecuteStreamIncrementalFragments(t *testing.T) {
 		t.Fatalf("remaining chunks = %q", chunks)
 	}
 	hostFramedEvents(t, append([]pluginapi.ExecutorStreamChunk{{Payload: []byte(`{"n":1}`)}}, chunks...))
-	host.assertClosed(t, false)
+	host.assertClosed(t, 0)
 }
 
 func TestExecuteStreamLongBackpressure(t *testing.T) {
@@ -283,7 +304,7 @@ func TestExecuteStreamLongBackpressure(t *testing.T) {
 		}
 	}
 	hostFramedEvents(t, chunks)
-	host.assertClosed(t, false)
+	host.assertClosed(t, 0)
 }
 
 func TestExecuteStreamInterruptedAndCancelled(t *testing.T) {
@@ -319,10 +340,101 @@ func TestExecuteStreamInterruptedAndCancelled(t *testing.T) {
 			if len(chunks) != 0 {
 				t.Fatalf("truncated event was emitted: %q", chunks)
 			}
-			host.assertClosed(t, true)
+			wantStatus := http.StatusBadGateway
+			if mode == "host panic" {
+				wantStatus = http.StatusServiceUnavailable
+			}
+			host.assertClosed(t, wantStatus)
 			provider, _ := h.state.Provider()
 			waitUntil(t, "stream goroutine and host callbacks to drain", func() bool { return provider.bridge().inflight.pending() == 0 })
 		})
+	}
+}
+
+type byteFragmentReader struct {
+	data []byte
+	err  error
+}
+
+func (r *byteFragmentReader) Read(out []byte) (int, error) {
+	if len(r.data) == 0 {
+		if r.err != nil {
+			return 0, r.err
+		}
+		return 0, io.EOF
+	}
+	out[0] = r.data[0]
+	r.data = r.data[1:]
+	return 1, nil
+}
+
+func TestEventReaderByteFragmentsAndReadErrors(t *testing.T) {
+	body := "event: message\r\ndata: {\"content\":\r\ndata: \"雪 data: [DONE]\"}\r\n\r\ndata: [DONE]\r\n\r\n"
+	reader := newEventReader(&byteFragmentReader{data: []byte(body)}, true)
+	payload, err := reader.next()
+	if err != nil || string(payload) != `{"content":"雪 data: [DONE]"}` {
+		t.Fatalf("split UTF-8/CRLF/multiline JSON changed: %q, %v", payload, err)
+	}
+	if _, err := reader.next(); !errors.Is(err, io.EOF) {
+		t.Fatalf("DONE = %v", err)
+	}
+
+	for _, body := range []string{"data: {\"n\":", "data: {\"n\":1}\n\n"} {
+		upstreamErr := errors.New("fixture read failed")
+		reader := newEventReader(&byteFragmentReader{data: []byte(body), err: upstreamErr}, true)
+		payload, err := reader.next()
+		if strings.HasSuffix(body, "\n\n") {
+			if err != nil || string(payload) != `{"n":1}` {
+				t.Fatalf("data before error lost: %q %v", payload, err)
+			}
+			_, err = reader.next()
+		}
+		if !errors.Is(err, upstreamErr) {
+			t.Fatalf("read error lost: %v", err)
+		}
+	}
+}
+
+func TestExecuteStreamRejectsOversizeAndMalformedEvents(t *testing.T) {
+	for _, body := range []string{"data: not JSON\n\n", "data: " + strings.Repeat(" ", maxUpstreamResponseBytes) + "{}\n\n"} {
+		h, host := newStreamExecutorHandler(t)
+		host.respondSSE(body)
+		raw, _ := h.Handle(pluginabi.MethodExecutorExecuteStream, streamPayload(t))
+		envelope := decodeEnvelope(t, raw)
+		if envelope.OK || envelope.Error == nil || envelope.Error.Code != "upstream_invalid_response" || envelope.Error.HTTPStatus != http.StatusBadGateway {
+			t.Fatalf("invalid upstream accepted: %s", raw)
+		}
+		host.mu.Lock()
+		closed := host.upClosed
+		host.mu.Unlock()
+		if closed != 1 {
+			t.Errorf("upstream not released: %d", closed)
+		}
+	}
+}
+
+func TestExecutorStreamFrozenCallbacksDoNotSpendThePumpEntry(t *testing.T) {
+	bridge := newHostBridge(func(context.Context, string, []byte) ([]byte, error) { return okResult(struct{}{}) })
+	if !bridge.inflight.begin() {
+		t.Fatal("pump reservation refused")
+	}
+	idle := bridge.inflight.freeze()
+	if err := bridge.invoke(context.Background(), pluginabi.MethodHostLog, struct{}{}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if pending := bridge.inflight.pending(); pending != 1 {
+		t.Fatalf("frozen callback spent pump entry: %d", pending)
+	}
+	select {
+	case <-idle:
+		t.Fatal("idle signalled while pump is live")
+	default:
+	}
+	bridge.inflight.end()
+	select {
+	case <-idle:
+	default:
+		t.Fatal("pump completion did not release barrier")
 	}
 }
 
@@ -344,6 +456,6 @@ func TestExecuteStreamRetainsTheDrainBarrier(t *testing.T) {
 	if len(chunks) != 2 {
 		t.Fatalf("drain attempt interrupted the execution: %q", chunks)
 	}
-	host.assertClosed(t, false)
+	host.assertClosed(t, 0)
 	waitUntil(t, "the full stream lifetime to drain", func() bool { return provider.bridge().inflight.pending() == 0 })
 }
