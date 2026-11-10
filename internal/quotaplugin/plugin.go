@@ -15,7 +15,8 @@ const (
 	// discovery file stem (ollama-quota-v<version>.so).
 	Name = "ollama-quota"
 	// QuotaIdentifier is the provider key CPA matches against credential
-	// providers. The plugin handles Ollama credentials and nothing else.
+	// providers for Ollama. The plugin also serves the Command Code and
+	// OpenCode Go keys; see providers.go.
 	QuotaIdentifier = "ollama"
 	// Version is stamped into the registration metadata and names the
 	// published artifact the host hot-swaps.

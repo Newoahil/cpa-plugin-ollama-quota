@@ -28,7 +28,8 @@ func (r DrainReport) Error() string {
 
 func (r DrainReport) Unwrap() error { return ErrQuiesceIncomplete }
 
-// Provider is the pluginapi.QuotaProvider implementation for Ollama, in the
+// Provider is the pluginapi.QuotaProvider implementation for the three quota
+// providers this plugin serves — Ollama, Command Code and OpenCode Go — in the
 // internal form this package uses so it can be tested without the SDK's wire
 // types. The RPC layer (rpc.go) is the only adapter between the two.
 //
@@ -95,10 +96,18 @@ func (p *Provider) ID() string {
 
 // Describe is the internal form of QuotaProvider.DescribeQuota.
 //
-// SupportsReset is false because Ollama has no endpoint that resets a window;
-// ResetQuota refuses rather than reporting a reset that did not happen.
+// SupportedProviders names all three provider keys the quota path serves:
+// Ollama, Command Code and OpenCode Go. The host uses it in the second of its
+// two matching rounds, so a credential whose type is one of these keys routes
+// its quota request here.
+//
+// SupportsReset is false because none of the three has an endpoint that resets
+// a window; ResetQuota refuses rather than reporting a reset that did not
+// happen.
 func (p *Provider) Describe() (displayName string, supported []string, supportsReset bool) {
-	return "Ollama", []string{QuotaIdentifier}, false
+	supported = make([]string, len(SupportedProviders))
+	copy(supported, SupportedProviders)
+	return "Quota", supported, false
 }
 
 // Track registers a cancellable context so quiesce can abort an in-flight fetch
@@ -185,7 +194,7 @@ func (p *Provider) drain(timeout time.Duration) DrainReport {
 }
 
 // attemptTimeout is the budget for one whole collection attempt: the credential
-// read plus the Ollama HTTP request.
+// read plus the upstream HTTP request.
 //
 // SPEC 4.4's 20 seconds is the budget for 采集, which starts when the attempt
 // starts — at the credential — not when the first byte of HTTP goes out. A host

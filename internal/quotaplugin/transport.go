@@ -52,7 +52,7 @@ var _ ollama.Transport = (*transport)(nil)
 // Do implements ollama.Transport.
 func (t *transport) Do(request *http.Request) (*http.Response, error) {
 	if request == nil || request.URL == nil {
-		return nil, errors.New("the Ollama transport was given no request")
+		return nil, errors.New("the quota transport was given no request")
 	}
 	if t.bridge == nil {
 		return nil, ErrHostUnavailable
@@ -70,7 +70,7 @@ func (b *hostBridge) exchange(ctx context.Context, request *http.Request, callba
 	if request.Body != nil && request.Body != http.NoBody {
 		body, errRead := io.ReadAll(request.Body)
 		if errRead != nil {
-			return nil, fmt.Errorf("read the Ollama request body: %w", errRead)
+			return nil, fmt.Errorf("read the quota request body: %w", errRead)
 		}
 		hostRequest.Body = body
 	}
@@ -80,12 +80,12 @@ func (b *hostBridge) exchange(ctx context.Context, request *http.Request, callba
 		return nil, errExchange
 	}
 	// The host does not report the final URL, so the response names the request
-	// that was issued. The collector's pinned-origin check has already refused
-	// any request that was not aimed at ollama.com. A redirect the host chose to
-	// follow is invisible here and is the residual risk documented in
-	// docs/agents/quota.md and the PR description — it is an unmet SPEC 4.2
-	// constraint that depends on a host change, not something this plugin can
-	// detect or undo.
+	// that was issued. Each provider client's pinned-origin check has already
+	// refused any request that was not aimed at its own fixed origin. A redirect
+	// the host chose to follow is invisible here and is the residual risk
+	// documented in docs/agents/quota.md and the PR description — it is an unmet
+	// SPEC 4.2 constraint that depends on a host change, not something this
+	// plugin can detect or undo.
 	return &http.Response{
 		StatusCode: response.StatusCode,
 		Status:     fmt.Sprintf("%d %s", response.StatusCode, http.StatusText(response.StatusCode)),
@@ -125,7 +125,7 @@ func (b *hostBridge) exchangeWithDeadline(ctx context.Context, request pluginapi
 		// rather than an unclassified host refusal (ollama.networkError only
 		// recognises the context sentinels).
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return pluginapi.HTTPResponse{}, fmt.Errorf("the Ollama request ended with %w", ctxErr)
+			return pluginapi.HTTPResponse{}, fmt.Errorf("the quota request ended with %w", ctxErr)
 		}
 		return pluginapi.HTTPResponse{}, errDo
 	}
@@ -216,7 +216,7 @@ func (g *cancelGuard) release() {
 // host handed it, and that value must never reach a log line (SPEC 4.2).
 func (b *hostBridge) logNoteCancelledSafely() {
 	defer func() { _ = recover() }()
-	b.logNote(context.Background(), "error", "the Ollama quota collector's host cancel callback panicked; the operation may still be running")
+	b.logNote(context.Background(), "error", "the quota collector's host cancel callback panicked; the operation may still be running")
 }
 
 // openOperation opens one host HTTP operation so the request can be cancelled.

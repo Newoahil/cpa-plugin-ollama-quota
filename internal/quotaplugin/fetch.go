@@ -9,25 +9,30 @@ import (
 	"sync"
 	"time"
 
+	"github.com/LambdaTheory/cpa-plugin-ollama-quota/internal/cmc"
 	"github.com/LambdaTheory/cpa-plugin-ollama-quota/internal/ollama"
+	"github.com/LambdaTheory/cpa-plugin-ollama-quota/internal/opc"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
-// ErrQuotaResetUnsupported reports a reset request. Ollama has no endpoint that
-// resets a window, so the plugin refuses instead of pretending it worked.
-var ErrQuotaResetUnsupported = errors.New("resetting Ollama quota is not supported")
+// ErrQuotaResetUnsupported reports a reset request. None of the three upstreams
+// has an endpoint that resets a window, so the plugin refuses instead of
+// pretending it worked.
+var ErrQuotaResetUnsupported = errors.New("resetting this provider's quota is not supported")
 
 // reading is whatever is known about one credential: the last verified
 // collection, or the reason there is none.
 //
-// A stale snapshot is kept here rather than inside ollama.Snapshot on purpose:
-// the collector package refuses to hand old numbers back as if they were new,
-// and the decision to serve a stale value belongs to the layer that owns the
-// cache (SPEC 4.3). Every response built from a stale entry says so — see
-// quotaResponse.
+// A stale snapshot is kept here rather than inside a provider package on
+// purpose: the collector packages refuse to hand old numbers back as if they
+// were new, and the decision to serve a stale value belongs to the layer that
+// owns the cache (SPEC 4.3). Every response built from a stale entry says so —
+// see quotaResponse.
 type reading struct {
 	// snapshot is the last verified collection; zero when none has succeeded.
-	snapshot ollama.Snapshot
+	// It is provider-neutral, so the store, the staleness rules and the
+	// response builder work the same for all three providers.
+	snapshot quotaSnapshot
 	// observedAt is when snapshot was collected.
 	observedAt time.Time
 	// lastErr is the most recent failure, nil when the last attempt succeeded.
@@ -39,7 +44,7 @@ type reading struct {
 }
 
 // hasData reports whether the entry carries a verified reading.
-func (r reading) hasData() bool { return r.snapshot.HasData() }
+func (r reading) hasData() bool { return r.snapshot.hasData() }
 
 // store holds one reading per credential. It is the only mutable state the
 // provider keeps, and it is keyed by credential so two accounts can never share
@@ -63,7 +68,7 @@ func (s *store) load(key string) (reading, bool) {
 
 // succeeded records a verified reading and clears the failure state and any
 // backoff window.
-func (s *store) succeeded(key string, snapshot ollama.Snapshot) {
+func (s *store) succeeded(key string, snapshot quotaSnapshot) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.entries[key] = reading{snapshot: snapshot, observedAt: snapshot.ObservedAt}
@@ -109,12 +114,10 @@ func (s *store) forget(key string) {
 // a failure with nothing behind it returns an error and no numbers at all
 // (SPEC 4.3).
 //
-// The attempt as a whole — credential read included, not just the Ollama HTTP
+// The attempt as a whole — credential read included, not just the upstream HTTP
 // request — is bounded by one deadline (P2-1). Both host calls it makes
 // (host.auth.get and host.http.do) enforce it themselves, because a deadline set
 // here cannot reach a synchronous C callback (see hostBridge.callBounded).
-// fetchQuota is the entry point that owns its own budget: the whole attempt
-// (credential read plus HTTP) runs under one deadline minted here.
 func (p *Provider) fetchQuota(ctx context.Context, request pluginapi.QuotaFetchRequest, callbackID string) (pluginapi.QuotaFetchResponse, error) {
 	budget, cancelBudget := context.WithTimeout(ctx, p.attemptTimeout())
 	defer cancelBudget()
@@ -126,27 +129,28 @@ func (p *Provider) fetchQuota(ctx context.Context, request pluginapi.QuotaFetchR
 // HTTP request it feeds share ONE deadline instead of each claiming the
 // full timeout (P2-1). ctx must carry that deadline; if it does not, the
 // call fails rather than silently running unbounded.
+//
+// The provider named by the request decides which upstream is read. Every key
+// this plugin does not serve is refused with UnsupportedProviderError, so the
+// page never shows a figure collected for the wrong provider.
 func (p *Provider) fetchQuotaWithinBudget(budget context.Context, request pluginapi.QuotaFetchRequest, callbackID string) (pluginapi.QuotaFetchResponse, error) {
 	if _, ok := budget.Deadline(); !ok {
 		return pluginapi.QuotaFetchResponse{}, fmt.Errorf("%w: the quota fetch needs an attempt deadline", ErrHostUnavailable)
 	}
-	providerKey := ProviderKey(request.Provider)
-	if providerKey != "" && providerKey != QuotaIdentifier {
-		return pluginapi.QuotaFetchResponse{}, UnsupportedProviderError{Provider: providerKey}
+	provider, supported := canonicalProviderKey(request.Provider)
+	if !supported {
+		// An empty Provider is Ollama: the plugin started as Ollama's quota
+		// provider and a request without a key can only have come from that
+		// path.
+		if quotaProviderKey(request.Provider) != "" {
+			return pluginapi.QuotaFetchResponse{}, UnsupportedProviderError{Provider: quotaProviderKey(request.Provider)}
+		}
+		provider = QuotaIdentifier
 	}
 
-	saved, errCredential := p.settings.load()
-	credential := ollama.Credential{APIKey: saved}
-	if errCredential == nil && saved == "" {
-		credential, errCredential = p.resolveHostCredential(budget, request)
-	}
+	collect, key, errCredential := p.credentialFor(budget, request, provider)
 	if errCredential != nil {
 		return pluginapi.QuotaFetchResponse{}, errCredential
-	}
-
-	key := readingKey(request)
-	if saved != "" {
-		key = configuredReadingKey(credential.APIKey)
 	}
 	now := p.now()
 
@@ -161,7 +165,7 @@ func (p *Provider) fetchQuotaWithinBudget(budget context.Context, request plugin
 		return pluginapi.QuotaFetchResponse{}, &backoffError{until: until, now: now}
 	}
 
-	snapshot, errFetch := p.collect(budget, credential, callbackID, now)
+	snapshot, errFetch := collect(budget, callbackID, now)
 	if errFetch == nil {
 		p.store.succeeded(key, snapshot)
 		entry, _ := p.store.load(key)
@@ -169,23 +173,135 @@ func (p *Provider) fetchQuotaWithinBudget(budget context.Context, request plugin
 	}
 
 	retryAt := now
-	// A 429 carries a backoff even without a Retry-After header: #2 fills in a
-	// conservative default and reports HasRetryAfter=false to say so. The
-	// duration is what matters here, so it is used whichever branch it came
-	// from (see ollama.RetryAfterOf).
-	if wait, _ := ollama.RetryAfterOf(errFetch); wait > 0 {
+	// A 429 carries a backoff even without a Retry-After header: each provider
+	// package fills in a conservative default and reports HasRetryAfter=false to
+	// say so. The duration is what matters here, so it is used whichever branch
+	// it came from.
+	wait, _ := retryAfterOf(errFetch)
+	if wait > 0 {
 		retryAt = now.Add(wait)
 	}
 	p.store.failed(key, errFetch, retryAt)
 
 	if entry, ok := p.store.load(key); ok && entry.hasData() {
-		return quotaResponse(entry, errFetch.Error()), nil
+		// A rate-limited response is reported as a wait, not only as a failure:
+		// the figures below are the ones read before upstream closed the door,
+		// and the page has to be able to say why they are not being refreshed.
+		reason := errFetch.Error()
+		if wait > 0 {
+			reason = backoffReason(retryAt, now) + "; " + reason
+		}
+		return quotaResponse(entry, reason), nil
 	}
 	// Never collected successfully: report the failure, not a number.
 	return pluginapi.QuotaFetchResponse{}, errFetch
 }
 
-// resolveCredential reads the API key and cookie for one request.
+// collectorFunc performs one collection for a resolved credential.
+type collectorFunc func(ctx context.Context, callbackID string, now time.Time) (quotaSnapshot, error)
+
+// credentialFor resolves the credential for one provider and returns the
+// collector that reads it, plus the store key its reading is cached under.
+func (p *Provider) credentialFor(budget context.Context, request pluginapi.QuotaFetchRequest, provider string) (collect collectorFunc, key string, err error) {
+	switch provider {
+	case QuotaIdentifier:
+		// The page-configured API key (settings.json) is Ollama-only: it is the
+		// single key the settings page manages, and neither of the other two
+		// providers has a page yet.
+		saved, errSettings := p.settings.load()
+		credential := ollama.Credential{APIKey: saved}
+		if errSettings == nil && saved == "" {
+			credential, errSettings = p.resolveHostCredential(budget, request)
+		}
+		if errSettings != nil {
+			return nil, "", errSettings
+		}
+		key = readingKey(request)
+		if saved != "" {
+			key = configuredReadingKey(credential.APIKey)
+		}
+		return func(ctx context.Context, callbackID string, now time.Time) (quotaSnapshot, error) {
+			snapshot, errFetch := p.collect(ctx, credential, callbackID, now)
+			return ollamaSnapshot(snapshot), errFetch
+		}, key, nil
+
+	case CommandCodeProvider:
+		credential, errCredential := p.resolveAPICompatibleCredential(budget, request)
+		if errCredential != nil {
+			return nil, "", errCredential
+		}
+		key = providerReadingKey(provider, request, credential.apiKey)
+		return func(ctx context.Context, callbackID string, now time.Time) (quotaSnapshot, error) {
+			client := cmc.NewClient(
+				cmc.WithTransport(&transport{bridge: p.bridge(), callbackID: callbackID}),
+				cmc.WithTimeout(p.timeout),
+				cmc.WithClock(func() time.Time { return now }),
+				cmc.WithBaseURL(credential.baseURL),
+			)
+			snapshot, errFetch := client.Fetch(ctx, cmc.Credential{APIKey: credential.apiKey, BaseURL: credential.baseURL})
+			return cmcSnapshot(snapshot), errFetch
+		}, key, nil
+
+	case OpenCodeProvider:
+		credential, errCredential := p.resolveAPICompatibleCredential(budget, request)
+		if errCredential != nil {
+			return nil, "", errCredential
+		}
+		key = providerReadingKey(provider, request, credential.apiKey)
+		return func(ctx context.Context, callbackID string, now time.Time) (quotaSnapshot, error) {
+			client := opc.NewClient(
+				opc.WithTransport(&transport{bridge: p.bridge(), callbackID: callbackID}),
+				opc.WithTimeout(p.timeout),
+				opc.WithClock(func() time.Time { return now }),
+				opc.WithBaseURL(credential.baseURL),
+			)
+			snapshot, errFetch := client.Fetch(ctx, opc.Credential{APIKey: credential.apiKey, BaseURL: credential.baseURL})
+			return opcSnapshot(snapshot), errFetch
+		}, key, nil
+	}
+	return nil, "", UnsupportedProviderError{Provider: provider}
+}
+
+// apiCredential is one OpenAI-compatible credential as the quota path needs it.
+type apiCredential struct {
+	apiKey  string
+	baseURL string
+}
+
+// resolveAPICompatibleCredential reads the API key and base URL for a Command
+// Code or OpenCode Go request.
+//
+// The host normally fills Attributes, Metadata and StorageJSON before the RPC
+// call (internal/pluginhost/quota_provider.go callQuotaFetch), but that is
+// best-effort: an embedded host can call a quota provider directly, and a
+// runtime-only credential has no file. So when the request carries nothing
+// usable, the credential is read back through host.auth.get by index — the same
+// path the collector uses.
+func (p *Provider) resolveAPICompatibleCredential(ctx context.Context, request pluginapi.QuotaFetchRequest) (apiCredential, error) {
+	apiKey, baseURL, err := apiCompatibleCredential(request.Attributes, request.Metadata, request.StorageJSON)
+	if err == nil {
+		return apiCredential{apiKey: apiKey, baseURL: baseURL}, nil
+	}
+
+	index := strings.TrimSpace(request.AuthIndex)
+	bridge := p.bridge()
+	if index == "" || bridge == nil || bridge.call == nil {
+		return apiCredential{}, err
+	}
+	auth, errGet := bridge.getAuth(ctx, index)
+	if errGet != nil {
+		// Report the original problem: the missing field is what the operator
+		// has to fix, and the bridge error may only say the file is unreadable.
+		return apiCredential{}, err
+	}
+	apiKey, baseURL, errStored := apiCompatibleCredential(request.Attributes, request.Metadata, auth.JSON)
+	if errStored != nil {
+		return apiCredential{}, errStored
+	}
+	return apiCredential{apiKey: apiKey, baseURL: baseURL}, nil
+}
+
+// resolveCredential reads the API key and cookie for one Ollama request.
 //
 // The host normally puts the credential file's JSON in StorageJSON before the
 // RPC call (internal/pluginhost/quota_provider.go callQuotaFetch). It is not
@@ -234,7 +350,18 @@ func configuredReadingKey(key string) string {
 	return fmt.Sprintf("configured:%x", sha256.Sum256([]byte(key)))
 }
 
-// collect performs one collection through the host transport.
+// providerReadingKey identifies a non-Ollama credential. The provider is part
+// of the key so the same credential index can never serve two providers, and a
+// request that arrives with neither an index nor an id is still cacheable by a
+// hash of the key it used — the hash is never rendered.
+func providerReadingKey(provider string, request pluginapi.QuotaFetchRequest, apiKey string) string {
+	if index := readingKey(request); index != "" {
+		return provider + ":" + index
+	}
+	return fmt.Sprintf("%s:key:%x", provider, sha256.Sum256([]byte(apiKey)))
+}
+
+// collect performs one Ollama collection through the host transport.
 func (p *Provider) collect(ctx context.Context, credential ollama.Credential, callbackID string, now time.Time) (ollama.Snapshot, error) {
 	client := ollama.NewClient(
 		ollama.WithTransport(&transport{bridge: p.bridge(), callbackID: callbackID}),
@@ -242,6 +369,33 @@ func (p *Provider) collect(ctx context.Context, credential ollama.Credential, ca
 		ollama.WithClock(func() time.Time { return now }),
 	)
 	return client.Fetch(ctx, credential)
+}
+
+// retryAfterOf reports the backoff attached to err by whichever provider
+// package produced it. Exactly one of them can recognise the error, so the
+// others answer zero.
+//
+// A 429 that carried no Retry-After header still gets a conservative default
+// from its package and reports HasRetryAfter=false, so the second pass is what
+// makes "upstream said nothing" behave like a real backoff instead of an
+// immediate retry.
+func retryAfterOf(err error) (time.Duration, bool) {
+	retryAfterOfAll := []func(error) (time.Duration, bool){
+		ollama.RetryAfterOf,
+		cmc.RetryAfterOf,
+		opc.RetryAfterOf,
+	}
+	for _, lookup := range retryAfterOfAll {
+		if wait, ok := lookup(err); ok {
+			return wait, true
+		}
+	}
+	for _, lookup := range retryAfterOfAll {
+		if wait, _ := lookup(err); wait > 0 {
+			return wait, false
+		}
+	}
+	return 0, false
 }
 
 // readingKey identifies a credential. AuthIndex is the host's stable runtime
@@ -257,9 +411,11 @@ func readingKey(request pluginapi.QuotaFetchRequest) string {
 //
 // The mapping follows SPEC 3.1:
 //
-//   - plan    -> Subscription.Plan;
-//   - balance -> one currency metric keyed "balance";
-//   - windows -> one bucket each, RemainingFraction = remaining share.
+//   - plan     -> Subscription.Plan;
+//   - balance  -> one metric keyed "balance" (currency when upstream states
+//     one, a plain number when it reports credits);
+//   - windows  -> one bucket each under a group named for the provider,
+//     RemainingFraction = remaining share.
 //
 // staleReason is empty for a fresh reading. For a stale one it is the scrubbed
 // failure message, and it is written into the metric label and the bucket
@@ -279,39 +435,46 @@ func quotaResponse(entry reading, staleReason string) pluginapi.QuotaFetchRespon
 		if staleReason != "" {
 			label = "Balance · stale"
 		}
-		response.Summary = append(response.Summary, pluginapi.QuotaMetric{
-			Key:      "balance",
-			Label:    label,
-			Value:    snapshot.Balance.Amount,
-			Format:   "currency",
-			Currency: snapshot.Balance.Currency,
-		})
+		metric := pluginapi.QuotaMetric{
+			Key:   "balance",
+			Label: label,
+			Value: snapshot.Balance.Amount,
+		}
+		if currency := strings.TrimSpace(snapshot.Balance.Currency); currency != "" {
+			metric.Format = "currency"
+			metric.Currency = currency
+		} else {
+			// Credit figures that are not money: the page must not print a
+			// currency symbol upstream never stated.
+			metric.Format = "number"
+			metric.Unit = "credits"
+		}
+		response.Summary = append(response.Summary, metric)
 	}
 
 	if len(snapshot.Windows) > 0 {
-		group := pluginapi.QuotaGroup{DisplayName: "Ollama"}
+		group := pluginapi.QuotaGroup{DisplayName: providerDisplayName(snapshot.provider)}
 		for _, window := range snapshot.Windows {
 			group.Buckets = append(group.Buckets, quotaBucket(window, entry.observedAt, staleReason))
 		}
 		response.Groups = append(response.Groups, group)
 	}
 
-	// ServerTimeOffsetMs stays zero: nothing Ollama returns carries a server
-	// clock to compare against, and an invented offset would shift every reset
-	// time on the page.
+	// ServerTimeOffsetMs stays zero: none of the three upstreams returns a
+	// server clock to compare against, and an invented offset would shift every
+	// reset time on the page.
 	return response
 }
 
-// quotaBucket maps one ollama.Window onto a host bucket.
+// quotaBucket maps one quotaWindow onto a host bucket.
 //
 // RemainingFraction is the share of the window still available: 1 - used, not
-// used. ollama.Window holds UsedPercent (used, 0..100) and RemainingPercent()
-// already converts and clamps it, so the direction is decided in exactly one
-// place.
-func quotaBucket(window ollama.Window, observedAt time.Time, staleReason string) pluginapi.QuotaBucket {
+// used. quotaWindow holds the used share and its remainingFraction method is
+// the only place the direction is decided.
+func quotaBucket(window quotaWindow, observedAt time.Time, staleReason string) pluginapi.QuotaBucket {
 	bucket := pluginapi.QuotaBucket{
 		Window:            window.Name,
-		RemainingFraction: window.RemainingPercent() / 100,
+		RemainingFraction: window.remainingFraction(),
 	}
 	if window.ResetAt != nil {
 		bucket.ResetTime = window.ResetAt.UTC().Format(time.RFC3339)
@@ -320,7 +483,7 @@ func quotaBucket(window ollama.Window, observedAt time.Time, staleReason string)
 		bucket.ResetTime = window.ResetText
 	}
 
-	parts := make([]string, 0, 3)
+	parts := make([]string, 0, 4)
 	if label := strings.TrimSpace(window.Label); label != "" {
 		parts = append(parts, label)
 	}
@@ -329,6 +492,9 @@ func quotaBucket(window ollama.Window, observedAt time.Time, staleReason string)
 		parts = append(parts, observed)
 	} else {
 		parts = append(parts, "stale · last "+observed, staleReason)
+	}
+	if note := strings.TrimSpace(window.Note); note != "" {
+		parts = append(parts, note)
 	}
 	bucket.Description = strings.Join(parts, " · ")
 	return bucket

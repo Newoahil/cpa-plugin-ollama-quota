@@ -9,10 +9,11 @@ import (
 	"github.com/LambdaTheory/cpa-plugin-ollama-quota/internal/ollama"
 )
 
-// ErrIncompleteCredential reports a stored credential that carries neither an
-// API key nor a session cookie. It is an auth-class failure for the caller: the
+// ErrIncompleteCredential reports a stored credential that carries no usable
+// secret: for Ollama neither an API key nor a session cookie, for Command Code
+// and OpenCode Go no API key. It is an auth-class failure for the caller: the
 // operator has to fix the credential, and no request is sent upstream.
-var ErrIncompleteCredential = errors.New("the Ollama credential is incomplete")
+var ErrIncompleteCredential = errors.New("the credential is incomplete")
 
 // Credential field names, as stored by CPA and by omc.
 //
