@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/LambdaTheory/cpa-plugin-ollama-quota/internal/cmc"
 	"github.com/LambdaTheory/cpa-plugin-ollama-quota/internal/ollama"
+	"github.com/LambdaTheory/cpa-plugin-ollama-quota/internal/opc"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
@@ -300,6 +302,11 @@ func (h *Handler) handleFetch(raw []byte) ([]byte, error) {
 // The codes are the ones the host and the ticket name; only unsupported_provider
 // and invalid_request are acted on by the host today, the rest reach the page as
 // the message text.
+//
+// Every provider package reports the same four classes, so each class is checked
+// against all three: a 429 from Command Code must classify as rate_limited the
+// same way Ollama's does, or the page would show a generic failure instead of
+// "wait".
 func fetchErrorCode(err error) string {
 	switch {
 	case IsUnsupportedProvider(err):
@@ -308,17 +315,27 @@ func fetchErrorCode(err error) string {
 		return "credential_incomplete"
 	case errors.Is(err, ErrHostUnavailable):
 		return "host_unavailable"
-	case errors.Is(err, ollama.ErrRateLimit):
+	case isKind(err, ollama.ErrRateLimit, cmc.ErrRateLimit, opc.ErrRateLimit):
 		return "rate_limited"
-	case errors.Is(err, ollama.ErrAuth):
+	case isKind(err, ollama.ErrAuth, cmc.ErrAuth, opc.ErrAuth):
 		return "auth_failed"
-	case errors.Is(err, ollama.ErrParse):
+	case isKind(err, ollama.ErrParse, cmc.ErrParse, opc.ErrParse):
 		return "parse_failed"
-	case errors.Is(err, ollama.ErrNetwork):
+	case isKind(err, ollama.ErrNetwork, cmc.ErrNetwork, opc.ErrNetwork):
 		return "upstream_unreachable"
 	default:
 		return "quota_fetch_failed"
 	}
+}
+
+// isKind reports whether err matches any of the given class sentinels.
+func isKind(err error, sentinels ...error) bool {
+	for _, sentinel := range sentinels {
+		if errors.Is(err, sentinel) {
+			return true
+		}
+	}
+	return false
 }
 
 // fetchErrorMessage is the text the host puts in its 502 body, so it must be
@@ -327,12 +344,12 @@ func fetchErrorCode(err error) string {
 // unrecognised error from being rendered as an empty string.
 func fetchErrorMessage(err error) string {
 	if err == nil {
-		return "the Ollama quota fetch failed"
+		return "the quota fetch failed"
 	}
 	if message := strings.TrimSpace(err.Error()); message != "" {
 		return message
 	}
-	return "the Ollama quota fetch failed"
+	return "the quota fetch failed"
 }
 
 func (h *Handler) handleReset(raw []byte) ([]byte, error) {

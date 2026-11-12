@@ -80,7 +80,7 @@ func (h *Handler) handleSettings(req pluginapi.ManagementRequest) ([]byte, error
 			if !entry.observedAt.IsZero() {
 				result.CollectedAt = entry.observedAt.UTC().Format(time.RFC3339)
 			}
-			result.Balance = entry.snapshot.Balance
+			result.Balance = ollamaBalance(entry.snapshot.Balance)
 			if entry.lastErr != nil {
 				result.Error = "采集失败，请检查 API Key 或稍后重试"
 				if entry.hasData() { result.Error = "采集失败，已保留上次结果" }
@@ -89,4 +89,19 @@ func (h *Handler) handleSettings(req pluginapi.ManagementRequest) ([]byte, error
 		}
 	}
 	return managementJSON(http.StatusOK, result)
+}
+
+// ollamaBalance narrows the provider-neutral balance back to the Ollama type the
+// settings page renders. The page only ever shows a reading for the key it
+// manages, which is always Ollama's, so a reading with no balance stays nil.
+func ollamaBalance(balance *quotaBalance) *ollama.Balance {
+	if balance == nil {
+		return nil
+	}
+	return &ollama.Balance{
+		Amount:    balance.Amount,
+		Currency:  balance.Currency,
+		Included:  balance.Included,
+		Purchased: balance.Purchased,
+	}
 }

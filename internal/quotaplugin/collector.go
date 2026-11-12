@@ -8,7 +8,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
-// collector refreshes every Ollama credential on a timer, so the quota page has
+// collector refreshes every quota credential on a timer, so the quota page has
 // figures to show before anyone opens it.
 //
 // Exactly one collector goroutine runs per plugin instance, and it is the only
@@ -38,7 +38,7 @@ func (c *collector) run(ctx context.Context) {
 	// the CPA process.
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			c.safeLog(ctx, "error", "the Ollama quota collector panicked and stopped")
+			c.safeLog(ctx, "error", "the quota collector panicked and stopped")
 		}
 	}()
 
@@ -58,7 +58,7 @@ func (c *collector) run(ctx context.Context) {
 	}
 }
 
-// sweepOnce refreshes every Ollama credential once.
+// sweepOnce refreshes every quota credential once.
 //
 // A panic ends this sweep only, never the timer: listAuths and one credential's
 // callbacks are both host code, and losing the background refresh for the rest
@@ -70,7 +70,7 @@ func (c *collector) sweepOnce(ctx context.Context) {
 	}
 	refreshed, failed, recovered := c.sweepOnceSafely(ctx)
 	if recovered {
-		c.safeLog(ctx, "error", "the Ollama quota collector panicked during a sweep; the next sweep will retry")
+		c.safeLog(ctx, "error", "the quota collector panicked during a sweep; the next sweep will retry")
 	}
 	c.report(refreshed, failed)
 }
@@ -87,13 +87,22 @@ func (c *collector) sweepOnceSafely(ctx context.Context) (refreshed, failed int,
 	bridge := c.provider.bridge()
 	// Page configuration is independently collectable, including when the host
 	// has no Ollama auth file or cannot enumerate its credential directory.
+	//
+	// It no longer ends the sweep: the page-configured key is Ollama's alone, and
+	// returning here would stop every Command Code and OpenCode Go credential
+	// from ever being refreshed while that key is saved. So the configured key is
+	// collected, and the enumeration below refreshes the OTHER providers. Ollama
+	// file credentials are skipped in that loop — with a key configured they
+	// would all resolve to that same key and rewrite one store entry (see
+	// credentialFor).
+	configured := false
 	if key, err := c.provider.settings.load(); err == nil && key != "" {
+		configured = true
 		if _, err := c.provider.fetchQuota(ctx, pluginapi.QuotaFetchRequest{Provider: QuotaIdentifier}, ""); err != nil {
 			failed++
 		} else {
 			refreshed++
 		}
-		return refreshed, failed, false
 	}
 	// The enumeration is bounded by the same per-attempt budget as a collection:
 	// it is host code that can block, and it runs before any fetch, so an
@@ -104,15 +113,18 @@ func (c *collector) sweepOnceSafely(ctx context.Context) (refreshed, failed int,
 	cancelList()
 	if errList != nil {
 		// The bridge's own message names the callback, never a credential.
-		c.safeLog(ctx, "warning", "the Ollama quota collector could not list credentials: "+errList.Error())
-		return 0, 0, false
+		c.safeLog(ctx, "warning", "the quota collector could not list credentials: "+errList.Error())
+		return refreshed, failed, false
 	}
 
 	for _, entry := range entries {
 		if ctx.Err() != nil {
 			return refreshed, failed, false
 		}
-		if !isOllamaCredential(entry) {
+		if !isQuotaCredential(entry) {
+			continue
+		}
+		if configured && isOllamaCredentialEntry(entry) {
 			continue
 		}
 		if authIndexOf(entry) == "" {
@@ -140,7 +152,7 @@ func (c *collector) refreshOne(ctx context.Context, bridge *hostBridge, entry pl
 		if recovered := recover(); recovered != nil {
 			// The recovered value is never formatted into the message: it can be
 			// anything the code that panicked chose.
-			c.safeLog(ctx, "error", "the Ollama quota collector panicked while refreshing a credential")
+			c.safeLog(ctx, "error", "the quota collector panicked while refreshing a credential")
 			ok = false
 		}
 	}()
@@ -161,14 +173,18 @@ func (c *collector) refreshOne(ctx context.Context, bridge *hostBridge, entry pl
 		// index — never its contents. It is the only way to tell "the host has
 		// not loaded this credential yet", which is normal during start-up, from
 		// "the host refuses this callback".
-		c.safeLog(ctx, "warning", "the Ollama quota collector could not read a credential: "+errGet.Error())
+		c.safeLog(ctx, "warning", "the quota collector could not read a credential: "+errGet.Error())
 		return false
 	}
 
+	// The request names the credential's OWN provider. Sending a fixed key
+	// would collect every credential through the Ollama client, which is how a
+	// three-provider plugin would quietly report one provider's numbers for
+	// another's credential.
 	request := pluginapi.QuotaFetchRequest{
 		AuthIndex:   index,
 		AuthID:      entry.ID,
-		Provider:    QuotaIdentifier,
+		Provider:    credentialProvider(entry),
 		StorageJSON: auth.JSON,
 	}
 	// Collection failures are already recorded in the store as that
@@ -182,15 +198,49 @@ func (c *collector) refreshOne(ctx context.Context, bridge *hostBridge, entry pl
 	return true
 }
 
-// isOllamaCredential reports whether a host credential belongs to this plugin.
-// A credential that declares no provider is treated as Ollama's, because the
-// host only routes a plugin's own credentials to it.
-func isOllamaCredential(entry pluginapi.HostAuthFileEntry) bool {
-	provider := strings.ToLower(strings.TrimSpace(entry.Provider))
+// isQuotaCredential reports whether a host credential belongs to this plugin.
+//
+// Provider is what the host derives from the credential's type and is what a
+// quota request carries, so it is read first; Type is the fallback for a listing
+// that only carries the file's own type. Both are matched case-insensitively
+// against the three keys this plugin serves — including
+// "openai-compatible-command code", whose internal space must be preserved.
+//
+// A credential that declares neither is treated as Ollama's, because the host
+// only routes a plugin's own credentials to it and this plugin's first identity
+// is the Ollama quota provider.
+func isQuotaCredential(entry pluginapi.HostAuthFileEntry) bool {
+	provider := credentialProvider(entry)
 	if provider == "" {
-		provider = strings.ToLower(strings.TrimSpace(entry.Type))
+		// No provider and no type: the host only routes this plugin's own
+		// credentials to it, and this plugin's first identity is Ollama's.
+		return true
 	}
-	return provider == "" || provider == QuotaIdentifier
+	_, supported := canonicalProviderKey(provider)
+	return supported
+}
+
+// credentialProvider returns the provider key of a listed credential: what the
+// host derived (Provider), or the file's own type when the listing carries only
+// that. The value is returned as the host spelled it, because the quota request
+// must name a key the host recognizes.
+func credentialProvider(entry pluginapi.HostAuthFileEntry) string {
+	if provider := strings.TrimSpace(entry.Provider); provider != "" {
+		return provider
+	}
+	return strings.TrimSpace(entry.Type)
+}
+
+// isOllamaCredentialEntry reports whether a listed credential is Ollama's. An
+// entry that declares neither a provider nor a type counts as Ollama's, matching
+// isQuotaCredential.
+func isOllamaCredentialEntry(entry pluginapi.HostAuthFileEntry) bool {
+	provider := credentialProvider(entry)
+	if provider == "" {
+		return true
+	}
+	canonical, supported := canonicalProviderKey(provider)
+	return supported && canonical == QuotaIdentifier
 }
 
 // authIndexOf prefers the runtime index, falling back to the credential id.

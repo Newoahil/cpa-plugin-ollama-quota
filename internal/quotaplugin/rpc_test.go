@@ -160,14 +160,22 @@ func TestQuotaDescribe(t *testing.T) {
 	if err := json.Unmarshal(decodeEnvelope(t, raw).Result, &resp); err != nil {
 		t.Fatalf("decode describe: %v", err)
 	}
-	if resp.DisplayName != "Ollama" {
-		t.Errorf("display_name = %q, want Ollama", resp.DisplayName)
+	if resp.DisplayName != "Quota" {
+		t.Errorf("display_name = %q, want Quota", resp.DisplayName)
 	}
-	if len(resp.SupportedProviders) != 1 || resp.SupportedProviders[0] != "ollama" {
-		t.Errorf("supported_providers = %v, want [ollama]", resp.SupportedProviders)
+	// The three provider keys are matched verbatim by the host, including the
+	// space inside the Command Code key.
+	want := []string{"ollama", "openai-compatible-command code", "openai-compatible-opencode"}
+	if len(resp.SupportedProviders) != len(want) {
+		t.Fatalf("supported_providers = %v, want %v", resp.SupportedProviders, want)
+	}
+	for i, key := range want {
+		if resp.SupportedProviders[i] != key {
+			t.Errorf("supported_providers[%d] = %q, want %q", i, resp.SupportedProviders[i], key)
+		}
 	}
 	if resp.SupportsReset {
-		t.Error("supports_reset must be false: Ollama has no reset endpoint")
+		t.Error("supports_reset must be false: none of the three has a reset endpoint")
 	}
 }
 
