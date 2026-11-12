@@ -127,7 +127,8 @@ quota providers: ollama + command code + opencode
 （used > cap，`exceeded=true`），所以显示剩余 0%，不是解析失败。
 
 **仍未做**：打开三家官网控制台人眼比对同一个账号。这需要浩文登录，脚本代替不了。
-验证环境保留在运行中，可直接打开 `http://127.0.0.1:18700/management.html#/quota` 比。
+验证容器已于 2026-11-12 18:22 关闭（含真 key 生成的 `.runtime/` 一并删除）；
+需要比对时按上面的复现命令重新 `up`。
 
 ## V4 降级 —— 3 过、2 未验
 
