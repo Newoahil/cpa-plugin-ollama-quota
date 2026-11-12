@@ -80,6 +80,7 @@ type fullFetchPayload struct {
 		Key      string  `json:"key"`
 		Label    string  `json:"label"`
 		Value    float64 `json:"value"`
+		Unit     string  `json:"unit"`
 		Format   string  `json:"format"`
 		Currency string  `json:"currency"`
 	} `json:"summary"`
@@ -129,15 +130,24 @@ func TestFetchCommandCodeMapsCreditsAndWindows(t *testing.T) {
 	if payload.Subscription == nil || payload.Subscription.Plan != "Max" {
 		t.Errorf("plan = %+v, want Max", payload.Subscription)
 	}
-	if len(payload.Summary) != 1 {
-		t.Fatalf("summary = %+v, want one balance metric", payload.Summary)
+	if len(payload.Summary) != 2 {
+		t.Fatalf("summary = %+v, want balance plus monthly remaining", payload.Summary)
 	}
 	// 12.5 plan + 3 purchased credits.
-	if payload.Summary[0].Value != 15.5 {
-		t.Errorf("balance = %v, want 15.5 credits", payload.Summary[0].Value)
+	if payload.Summary[0].Key != "balance" || payload.Summary[0].Value != 15.5 {
+		t.Errorf("balance = %+v, want 15.5 credits", payload.Summary[0])
 	}
 	if payload.Summary[0].Format != "number" || payload.Summary[0].Currency != "" {
 		t.Errorf("credit figure rendered as %q/%q, want a plain number", payload.Summary[0].Format, payload.Summary[0].Currency)
+	}
+	// The monthly metric is the plan credit alone (12.5, not the 15.5 total),
+	// and the fixture subscription states no period end.
+	monthly := payload.Summary[1]
+	if monthly.Key != "monthly_remaining" || monthly.Value != 12.5 || monthly.Unit != "credits" || monthly.Format != "number" {
+		t.Errorf("monthly metric = %+v, want 12.5 credits", monthly)
+	}
+	if monthly.Label != "Monthly remaining" {
+		t.Errorf("monthly label = %q, want no reset wording", monthly.Label)
 	}
 	if len(payload.Groups) != 1 || payload.Groups[0].DisplayName != "Command Code" {
 		t.Fatalf("groups = %+v, want one group named Command Code", payload.Groups)
@@ -175,8 +185,38 @@ func TestFetchCommandCodeMapsCreditsAndWindows(t *testing.T) {
 	}
 }
 
+// The monthly metric carries the billing period end in its label: QuotaMetric
+// has no reset field and the management page renders the label verbatim.
+func TestFetchCommandCodeMonthlyMetricCarriesResetDate(t *testing.T) {
+	handler, _ := newProviderPlugin(t, map[string]any{
+		"type":     CommandCodeProvider,
+		"api_key":  "cmc-fixture-key",
+		"base_url": "https://api.commandcode.ai/provider/v1",
+	}, map[string]string{
+		"https://api.commandcode.ai/alpha/billing/credits": cmcCreditsBody,
+		"https://api.commandcode.ai/alpha/billing/subscriptions": `{"success":true,"data":{"planId":"individual-max","status":"active",` +
+			`"currentPeriodEnd":"2026-12-06T08:02:28.000Z"}}`,
+	})
+
+	payload := fetchFull(t, handler, CommandCodeProvider)
+	if len(payload.Summary) != 2 {
+		t.Fatalf("summary = %+v, want balance plus monthly remaining", payload.Summary)
+	}
+	monthly := payload.Summary[1]
+	if monthly.Key != "monthly_remaining" || monthly.Value != 12.5 {
+		t.Errorf("monthly metric = %+v, want 12.5", monthly)
+	}
+	if monthly.Label != "Monthly remaining · resets 2026-12-06" {
+		t.Errorf("monthly label = %q, want the reset date in it", monthly.Label)
+	}
+	// The monthly figure is not a bucket: the windows stay untouched.
+	if len(payload.Groups) != 1 || len(payload.Groups[0].Buckets) != 2 {
+		t.Fatalf("groups = %+v, want the two windows only", payload.Groups)
+	}
+}
+
 // Credits succeeding while subscriptions fails still yields the balance and the
-// windows: the plan name is the only thing lost.
+// windows: the plan name and the monthly figure are the only things lost.
 func TestFetchCommandCodeSurvivesSubscriptionFailure(t *testing.T) {
 	handler, _ := newProviderPlugin(t, map[string]any{
 		"type":    CommandCodeProvider,
@@ -188,8 +228,8 @@ func TestFetchCommandCodeSurvivesSubscriptionFailure(t *testing.T) {
 	if payload.Subscription != nil && payload.Subscription.Plan != "" {
 		t.Errorf("plan = %q, want none", payload.Subscription.Plan)
 	}
-	if len(payload.Summary) != 1 || payload.Summary[0].Value != 15.5 {
-		t.Errorf("summary = %+v, want the credit figure", payload.Summary)
+	if len(payload.Summary) != 1 || payload.Summary[0].Key != "balance" || payload.Summary[0].Value != 15.5 {
+		t.Errorf("summary = %+v, want the credit figure and no monthly metric", payload.Summary)
 	}
 	if len(payload.Groups) != 1 || len(payload.Groups[0].Buckets) != 2 {
 		t.Errorf("groups = %+v, want both windows", payload.Groups)

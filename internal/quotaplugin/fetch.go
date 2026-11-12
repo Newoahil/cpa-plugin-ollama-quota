@@ -414,6 +414,8 @@ func readingKey(request pluginapi.QuotaFetchRequest) string {
 //   - plan     -> Subscription.Plan;
 //   - balance  -> one metric keyed "balance" (currency when upstream states
 //     one, a plain number when it reports credits);
+//   - monthly  -> one metric keyed "monthly_remaining", a plain credit figure
+//     whose label carries the reset date when it is known;
 //   - windows  -> one bucket each under a group named for the provider,
 //     RemainingFraction = remaining share.
 //
@@ -450,6 +452,29 @@ func quotaResponse(entry reading, staleReason string) pluginapi.QuotaFetchRespon
 			metric.Unit = "credits"
 		}
 		response.Summary = append(response.Summary, metric)
+	}
+
+	// The monthly plan credit is a figure, not a window. Command Code states
+	// the remaining amount but no used/cap pair, and the host drops every
+	// bucket without a remainingFraction — so a bucket here would have to
+	// invent a percentage upstream never stated. The reset date rides in the
+	// label instead: QuotaMetric has no reset field, and the management page
+	// renders the label verbatim.
+	if monthly := snapshot.Monthly; monthly != nil {
+		label := "Monthly remaining"
+		if monthly.ResetAt != nil {
+			label += " · resets " + monthly.ResetAt.UTC().Format("2006-01-02")
+		}
+		if staleReason != "" {
+			label += " · stale"
+		}
+		response.Summary = append(response.Summary, pluginapi.QuotaMetric{
+			Key:    "monthly_remaining",
+			Label:  label,
+			Value:  monthly.Remaining,
+			Unit:   "credits",
+			Format: "number",
+		})
 	}
 
 	if len(snapshot.Windows) > 0 {

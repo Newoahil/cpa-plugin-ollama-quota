@@ -19,22 +19,33 @@ import (
 //	  }
 //	}
 //
+// monthlyCredits is the remaining plan credit for the current billing period,
+// not the allowance granted: upstream reports no monthly used/cap pair at all
+// (windowLimits only has the 5-hour and weekly windows), so there is no monthly
+// percentage to state.
+//
 // windowLimits.exceeded is deliberately NOT decoded. Command Code reports it as
 // null while no window is over its cap and as the NAME of the over-cap window
 // ("weekly") once one is, so a bool field makes exactly the exhausted accounts
 // fail to decode and their whole snapshot get dropped. Each window's own
 // exceeded bool already carries the information.
 type creditsPayload struct {
-	Credits *struct {
-		MonthlyCredits   *float64 `json:"monthlyCredits"`
-		PurchasedCredits *float64 `json:"purchasedCredits"`
-		FreeCredits      *float64 `json:"freeCredits"`
-	} `json:"credits"`
+	Credits      *creditsBuckets `json:"credits"`
 	WindowLimits *struct {
 		Limited  bool           `json:"limited"`
 		FiveHour *accountWindow `json:"fiveHour"`
 		Weekly   *accountWindow `json:"weekly"`
 	} `json:"windowLimits"`
+}
+
+// creditsBuckets are the three credit figures. monthlyCredits stays raw so a
+// drifted payload (a string, say) costs the monthly figure rather than the
+// whole reading; the other two are read as numbers because their only role is
+// the balance sum.
+type creditsBuckets struct {
+	MonthlyCredits   json.RawMessage `json:"monthlyCredits"`
+	PurchasedCredits *float64        `json:"purchasedCredits"`
+	FreeCredits      *float64        `json:"freeCredits"`
 }
 
 type accountWindow struct {
@@ -49,7 +60,11 @@ type accountWindow struct {
 // parsedCredits is the outcome of reading a credits payload.
 type parsedCredits struct {
 	Balance *Balance
-	Windows []Window
+	// MonthlyCredits is the remaining plan credit for the billing period, when
+	// the payload stated a usable figure. Upstream reports no used/cap for it,
+	// so it is a figure, never a window.
+	MonthlyCredits *float64
+	Windows        []Window
 }
 
 // parseCredits maps the credits payload onto a snapshot's fields.
@@ -66,6 +81,9 @@ func parseCredits(body []byte) (parsedCredits, error) {
 	}
 
 	result := parsedCredits{Balance: balanceFromPayload(payload.Credits)}
+	if payload.Credits != nil {
+		result.MonthlyCredits = creditAmount(payload.Credits.MonthlyCredits)
+	}
 	if limits := payload.WindowLimits; limits != nil {
 		for _, spec := range []struct {
 			name  string
@@ -95,18 +113,12 @@ func parseCredits(body []byte) (parsedCredits, error) {
 // Either bucket alone is usable. A bucket that is present but not a usable
 // figure is ignored rather than failing the whole read: the remaining credit is
 // still the number the page needs.
-func balanceFromPayload(credits *struct {
-	MonthlyCredits   *float64 `json:"monthlyCredits"`
-	PurchasedCredits *float64 `json:"purchasedCredits"`
-	FreeCredits      *float64 `json:"freeCredits"`
-}) *Balance {
+func balanceFromPayload(credits *creditsBuckets) *Balance {
 	if credits == nil {
 		return nil
 	}
-	var monthly, purchased, free *float64
-	if usable(credits.MonthlyCredits) {
-		monthly = credits.MonthlyCredits
-	}
+	monthly := creditAmount(credits.MonthlyCredits)
+	var purchased, free *float64
 	if usable(credits.PurchasedCredits) {
 		purchased = credits.PurchasedCredits
 	}
@@ -132,6 +144,22 @@ func balanceFromPayload(credits *struct {
 		balance.Purchased = &value
 	}
 	return balance
+}
+
+// creditAmount reads a credit figure that may be spelled as a JSON number or as
+// a numeric string. Missing, non-numeric, negative or non-finite values are no
+// figure at all: the monthly credit is then not shown, rather than shown as
+// zero.
+func creditAmount(raw json.RawMessage) *float64 {
+	text := strings.Trim(strings.TrimSpace(string(raw)), `"`)
+	if text == "" || text == "null" {
+		return nil
+	}
+	value, err := strconv.ParseFloat(text, 64)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+		return nil
+	}
+	return &value
 }
 
 // usable reports whether a credit figure is a finite, non-negative number.
@@ -207,34 +235,67 @@ func clampPercent(value float64) float64 {
 // roundCents keeps cents exact for the wire consumer.
 func roundCents(amount float64) float64 { return math.Round(amount*100) / 100 }
 
-// parseSubscription reads the plan identity. It reports false when the payload
-// carries none, which the caller treats as "no plan name", not as a failure.
+// subscription is the plan identity and billing period end read from the
+// subscriptions endpoint.
+type subscription struct {
+	// PlanID is the vendor's plan id as stated (trimmed), kept for lookups.
+	PlanID string
+	// Plan is the display name resolved from PlanID.
+	Plan string
+	// CurrentPeriodEnd is when the current billing period ends — the instant
+	// the monthly allowance renews — when upstream stated a readable one.
+	CurrentPeriodEnd *time.Time
+}
+
+// parseSubscription reads the plan identity and the billing period end. It
+// reports false when the payload carries no plan, which the caller treats as
+// "no subscription reading", not as a failure.
 //
 // The payload is {"success": bool, "data": {"planId": str, "status": str,
-// "currentPeriodEnd": str}}. Only planId is used: the period end is the
-// billing-renewal instant, and this plugin has no plan window to attach it to.
-func parseSubscription(body []byte) (string, bool) {
+// "currentPeriodEnd": str}}. An unreadable currentPeriodEnd is dropped rather
+// than guessed at: the monthly figure is still shown, just without a reset
+// date.
+func parseSubscription(body []byte) (subscription, bool) {
 	var payload struct {
 		Success *bool `json:"success"`
 		Data    *struct {
-			PlanID string `json:"planId"`
-			Status string `json:"status"`
+			PlanID           string `json:"planId"`
+			Status           string `json:"status"`
+			CurrentPeriodEnd string `json:"currentPeriodEnd"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return "", false
+		return subscription{}, false
 	}
 	if payload.Success != nil && !*payload.Success {
-		return "", false
+		return subscription{}, false
 	}
 	if payload.Data == nil {
-		return "", false
+		return subscription{}, false
 	}
 	plan := strings.TrimSpace(payload.Data.PlanID)
 	if plan == "" {
-		return "", false
+		return subscription{}, false
 	}
-	return canonicalPlan(plan), true
+	result := subscription{PlanID: plan, Plan: canonicalPlan(plan)}
+	if periodEnd, ok := periodEndTime(payload.Data.CurrentPeriodEnd); ok {
+		result.CurrentPeriodEnd = &periodEnd
+	}
+	return result, true
+}
+
+// periodEndTime reads data.currentPeriodEnd, an RFC3339 instant. Anything
+// unreadable is dropped; nothing is inferred in its place.
+func periodEndTime(text string) (time.Time, bool) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return time.Time{}, false
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, trimmed)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return parsed.UTC(), true
 }
 
 // planNames maps a vendor plan id to its display name. The table is the

@@ -58,6 +58,14 @@ func TestFetchReadsCreditsAndSubscription(t *testing.T) {
 	if len(snapshot.Windows) != 2 {
 		t.Errorf("windows = %+v, want two", snapshot.Windows)
 	}
+	// The fixture subscription states no period end, so the monthly figure is
+	// present without a reset date.
+	if snapshot.Monthly == nil || snapshot.Monthly.Remaining != 12.5 {
+		t.Fatalf("monthly = %+v, want 12.5 remaining", snapshot.Monthly)
+	}
+	if snapshot.Monthly.ResetAt != nil {
+		t.Errorf("monthly reset = %v, want none", snapshot.Monthly.ResetAt)
+	}
 	if len(transport.requests) != 2 {
 		t.Fatalf("requests = %d, want 2", len(transport.requests))
 	}
@@ -87,6 +95,81 @@ func TestFetchSurvivesSubscriptionFailure(t *testing.T) {
 	}
 	if snapshot.Balance == nil || len(snapshot.Windows) != 2 {
 		t.Errorf("snapshot = %+v, want the credits and both windows", snapshot)
+	}
+	// No subscription reading means no confirmed plan, so no monthly figure.
+	if snapshot.Monthly != nil {
+		t.Errorf("monthly = %+v, want none when the subscription lookup failed", snapshot.Monthly)
+	}
+}
+
+// The monthly figure carries the billing period end as its reset instant.
+func TestFetchBuildsMonthlyCreditWithReset(t *testing.T) {
+	transport := &fakeTransport{responses: map[string]http.Response{
+		CreditsPath: jsonResponse(200, creditsFixture),
+		SubscriptionPath: jsonResponse(200,
+			`{"success":true,"data":{"planId":"individual-goat","status":"active","currentPeriodEnd":"2026-12-06T08:02:28.000Z"}}`),
+	}}
+	snapshot, err := NewClient(WithTransport(transport)).Fetch(context.Background(), Credential{APIKey: "k"})
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if snapshot.Plan != "GOAT" {
+		t.Errorf("plan = %q, want GOAT", snapshot.Plan)
+	}
+	if snapshot.Monthly == nil || snapshot.Monthly.Remaining != 12.5 {
+		t.Fatalf("monthly = %+v, want 12.5 remaining", snapshot.Monthly)
+	}
+	want := time.Date(2026, 12, 6, 8, 2, 28, 0, time.UTC)
+	if snapshot.Monthly.ResetAt == nil || !snapshot.Monthly.ResetAt.Equal(want) {
+		t.Errorf("monthly reset = %v, want %s", snapshot.Monthly.ResetAt, want)
+	}
+}
+
+// A period end the parser cannot read costs the reset date only: the monthly
+// figure is still shown.
+func TestFetchMonthlyCreditWithoutReadablePeriodEnd(t *testing.T) {
+	for _, periodEnd := range []string{"", "when the invoice clears", "2026-13-45T99:99:99Z"} {
+		transport := &fakeTransport{responses: map[string]http.Response{
+			CreditsPath: jsonResponse(200, creditsFixture),
+			SubscriptionPath: jsonResponse(200,
+				`{"success":true,"data":{"planId":"individual-goat","currentPeriodEnd":"`+periodEnd+`"}}`),
+		}}
+		snapshot, err := NewClient(WithTransport(transport)).Fetch(context.Background(), Credential{APIKey: "k"})
+		if err != nil {
+			t.Errorf("periodEnd %q: fetch: %v", periodEnd, err)
+			continue
+		}
+		if snapshot.Monthly == nil || snapshot.Monthly.Remaining != 12.5 {
+			t.Errorf("periodEnd %q: monthly = %+v, want 12.5 remaining", periodEnd, snapshot.Monthly)
+		}
+		if snapshot.Monthly != nil && snapshot.Monthly.ResetAt != nil {
+			t.Errorf("periodEnd %q: monthly reset = %v, want none", periodEnd, snapshot.Monthly.ResetAt)
+		}
+	}
+}
+
+// Without a usable monthly credit there is no monthly figure — not a zero.
+func TestFetchSkipsMonthlyWithoutUsableCredits(t *testing.T) {
+	const noMonthly = `{
+	  "credits": {"purchasedCredits": 3},
+	  "windowLimits": {
+	    "limited": true,
+	    "fiveHour": {"used": 30, "cap": 100, "exceeded": false, "resetAt": 1762000000000}
+	  }
+	}`
+	transport := &fakeTransport{responses: map[string]http.Response{
+		CreditsPath:      jsonResponse(200, noMonthly),
+		SubscriptionPath: jsonResponse(200, `{"success":true,"data":{"planId":"individual-goat","currentPeriodEnd":"2026-12-06T08:02:28.000Z"}}`),
+	}}
+	snapshot, err := NewClient(WithTransport(transport)).Fetch(context.Background(), Credential{APIKey: "k"})
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	if snapshot.Monthly != nil {
+		t.Errorf("monthly = %+v, want none without a monthly credit", snapshot.Monthly)
+	}
+	if snapshot.Balance == nil || snapshot.Balance.Amount != 3 {
+		t.Errorf("balance = %+v, want the purchased 3", snapshot.Balance)
 	}
 }
 
