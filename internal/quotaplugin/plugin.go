@@ -25,7 +25,13 @@ const (
 	// plugin is now the inference provider for "ollama", so one auth file serves
 	// both quota collection and inference. A changed artifact name is what makes
 	// the hot swap pick the new library up without restarting CPA.
-	Version = "0.2.1"
+	//
+	// 0.3.0 serves three credential providers at once (Ollama, Command Code,
+	// OpenCode Go; see providers.go) and streams inference incrementally through
+	// host.stream.emit instead of buffering the whole answer. The 0.2.1 artifact
+	// was never released under this version string; tag v0.2.1 predates both
+	// features, so this bump is what tells the host the library is new.
+	Version = "0.3.0"
 	// SchemaVersion is the RPC contract this plugin targets. Versions 2-8 add
 	// request-body and interceptor features the quota path does not use, and
 	// the host rejects a plugin reporting a schema newer than the host speaks.
