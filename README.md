@@ -48,14 +48,14 @@ omc 里已有这两条路的实现（`internal/ollama/`，`LambdaTheory/oh-my-cp
 
 ## 构建
 
-发布版本为 **0.3.0**，正式发布包为 **linux/arm64** 的
-`ollama-quota_0.3.0_linux_arm64.zip`，包内为 `ollama-quota-v0.3.0.so`。
+发布版本为 **0.3.1**，正式发布包为 **linux/arm64** 的
+`ollama-quota_0.3.1_linux_arm64.zip`，包内为 `ollama-quota-v0.3.1.so`。
 下方通用脚本默认使用主机架构；正式发布使用「Linux arm64 发布包」一节的工作流。
 
 本插件编译成 CPA 的动态库插件（`-buildmode=c-shared`）。本机没有 Go，用 Docker 编译 Linux 产物：
 
 ```sh
-scripts/build.sh                    # linux/amd64 -> dist/ollama-quota-v0.3.0.so
+scripts/build.sh                    # linux/amd64 -> dist/ollama-quota-v0.3.1.so
 scripts/build.sh -o dist/foo.so     # 指定输出路径
 scripts/build.sh --go               # 用本机的 Go 和 C 工具链编译当前平台
 ```
@@ -76,7 +76,7 @@ scripts/build.sh --go               # 用本机的 Go 和 C 工具链编译当�
 ```sh
 MSYS_NO_PATHCONV=1 docker run --rm \
   -v "$(pwd -W 2>/dev/null || pwd):/src" -w /src \
-  -e ASSISTANT_NO_SEND=1 -e RELEASE_VERSION=v0.3.0 \
+  -e ASSISTANT_NO_SEND=1 -e RELEASE_VERSION=v0.3.1 \
   golang:1.26.10-bookworm bash -euc '
     apt-get update -qq
     apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross python3
@@ -95,15 +95,15 @@ MSYS_NO_PATHCONV=1 docker run --rm \
 
 产物在 `dist/release/`：
 
-- `ollama-quota_0.3.0_linux_arm64.zip`：根目录只有 `ollama-quota-v0.3.0.so`，
+- `ollama-quota_0.3.1_linux_arm64.zip`：根目录只有 `ollama-quota-v0.3.1.so`，
   不含子目录、C 头文件或其他文件；MIT 许可全文保存在 ZIP 注释中。
 - `checksums.txt`：ZIP **整体**的 SHA-256，不是 `.so` 的哈希。
 
 已有 arm64 `.so` 时也可直接使用标准库打包脚本：
 
 ```sh
-ASSISTANT_NO_SEND=1 python3 scripts/package-release.py --version v0.3.0 \
-  --library dist/ollama-quota-v0.3.0.so --output-dir dist/release-check
+ASSISTANT_NO_SEND=1 python3 scripts/package-release.py --version v0.3.1 \
+  --library dist/ollama-quota-v0.3.1.so --output-dir dist/release-check
 ```
 
 每次使用空的输出目录；目录已有内容时脚本会报错，避免覆盖旧包或混用校验和。
@@ -111,7 +111,7 @@ ASSISTANT_NO_SEND=1 python3 scripts/package-release.py --version v0.3.0 \
 解压文件的 SHA-256 应与构建输入一致。
 
 ZIP 文件名遵循官方商店的 `<id>_<version>_<goos>_<goarch>.zip` 契约，版本不带 `v`；
-`checksums.txt` 中使用相同文件名。包内动态库保留 `-v0.3.0` 后缀，供 CPA 识别热升级。
+`checksums.txt` 中使用相同文件名。包内动态库保留 `-v0.3.1` 后缀，供 CPA 识别热升级。
 
 `.github/workflows/release.yml` 支持手动填写版本或匹配 `v*` 的 tag 触发，使用相同的
 Bookworm 工具链构建并检查 Linux/arm64 包。工作流只有 `contents: read` 权限，
@@ -155,7 +155,7 @@ QuotaFetchRequest.Metadata。沿用已有 CPA 凭证时，无需固定 auths 路
 - `POST /v0/management/plugins/ollama-quota/settings`：JSON `{"api_key":"..."}`，保存后立即采集。
 - `POST /v0/management/plugins/ollama-quota/refresh`：刷新已配置账号的余额。
 
-以下安装与热更新实测记录针对 **CPA v8.0.47 / 插件 v0.1.2**，不是 v0.3.0 的实测结论。
+以下安装与热更新实测记录针对 **CPA v8.0.47 / 插件 v0.1.2**，不是 v0.3.1 的实测结论。
 
 下面这份配置在 `CLIProxyAPI v8.0.47` 上验过：插件加载、注册、额度接口都通。
 
@@ -166,7 +166,7 @@ QuotaFetchRequest.Metadata。沿用已有 CPA 凭证时，无需固定 auths 路
 1. 把 `dist/` 里的库放进 CPA 的插件目录（路径相对于 CPA 的工作目录）：
 
    ```sh
-   cp dist/ollama-quota-v0.3.0.so /path/to/cpa/plugins/
+   cp dist/ollama-quota-v0.3.1.so /path/to/cpa/plugins/
    ```
 
 2. 准备插件配置，打开总开关并允许本插件。一份完整的 `config.yaml` 例子：
@@ -218,7 +218,7 @@ QuotaFetchRequest.Metadata。沿用已有 CPA 凭证时，无需固定 auths 路
    运行中的日志里应该出现：
 
    ```
-   pluginhost: plugin loaded plugin_id=ollama-quota version=0.3.0
+   pluginhost: plugin loaded plugin_id=ollama-quota version=0.3.1
    pluginhost: plugin registered plugin_id=ollama-quota ...
    ```
 
@@ -264,7 +264,7 @@ QuotaFetchRequest.Metadata。沿用已有 CPA 凭证时，无需固定 auths 路
 > 才会返回成功。重试不是「按上一次的结论作答」，而是每次都重新做一遍有界排空判定
 > （上限同上）。
 
-> 当前版本 0.3.0 已接真实采集：凭证里的 `api_key` 走 `GET https://ollama.com/api/balance`，
+> 当前版本 0.3.1 已接真实采集：凭证里的 `api_key` 走 `GET https://ollama.com/api/balance`，
 > 只有 `cookie` 时走 `GET https://ollama.com/settings` 解析 HTML；两条都失败时返回上一次成功读到的
 > 数字并标「已过期」，从没成功过则返回错误、不带数字。插件按 `interval_seconds`（默认 900 秒）
 > 定时采集，也能被 CPA 的额度页刷新按钮触发。

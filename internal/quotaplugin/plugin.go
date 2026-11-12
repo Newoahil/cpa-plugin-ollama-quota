@@ -31,7 +31,7 @@ const (
 	// host.stream.emit instead of buffering the whole answer. The 0.2.1 artifact
 	// was never released under this version string; tag v0.2.1 predates both
 	// features, so this bump is what tells the host the library is new.
-	Version = "0.3.0"
+	Version = "0.3.1"
 	// SchemaVersion is the RPC contract this plugin targets. Versions 2-8 add
 	// request-body and interceptor features the quota path does not use, and
 	// the host rejects a plugin reporting a schema newer than the host speaks.
