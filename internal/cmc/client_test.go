@@ -148,6 +148,33 @@ func TestFetchMonthlyCreditWithoutReadablePeriodEnd(t *testing.T) {
 	}
 }
 
+// A period end of the wrong JSON type costs the reset date only. Before the
+// field was kept raw, a number, object or bool made the whole subscription
+// decode fail, so the plan name and the monthly figure disappeared with it.
+func TestFetchMonthlyCreditSurvivesPeriodEndTypeDrift(t *testing.T) {
+	for _, periodEnd := range []string{`42`, `{"instant":"2026-12-06"}`, `true`} {
+		transport := &fakeTransport{responses: map[string]http.Response{
+			CreditsPath: jsonResponse(200, creditsFixture),
+			SubscriptionPath: jsonResponse(200,
+				`{"success":true,"data":{"planId":"individual-goat","currentPeriodEnd":`+periodEnd+`}}`),
+		}}
+		snapshot, err := NewClient(WithTransport(transport)).Fetch(context.Background(), Credential{APIKey: "k"})
+		if err != nil {
+			t.Errorf("periodEnd %s: fetch: %v", periodEnd, err)
+			continue
+		}
+		if snapshot.Plan != "GOAT" {
+			t.Errorf("periodEnd %s: plan = %q, want GOAT", periodEnd, snapshot.Plan)
+		}
+		if snapshot.Monthly == nil || snapshot.Monthly.Remaining != 12.5 {
+			t.Errorf("periodEnd %s: monthly = %+v, want 12.5 remaining", periodEnd, snapshot.Monthly)
+		}
+		if snapshot.Monthly != nil && snapshot.Monthly.ResetAt != nil {
+			t.Errorf("periodEnd %s: monthly reset = %v, want none", periodEnd, snapshot.Monthly.ResetAt)
+		}
+	}
+}
+
 // Without a usable monthly credit there is no monthly figure — not a zero.
 func TestFetchSkipsMonthlyWithoutUsableCredits(t *testing.T) {
 	const noMonthly = `{

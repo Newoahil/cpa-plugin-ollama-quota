@@ -44,9 +44,9 @@ type quotaBalance struct {
 }
 
 // quotaMonthlyCredit is the remaining monthly plan credit. It is rendered as a
-// summary metric, never as a bucket: the host requires every bucket to carry a
-// remaining fraction, and upstream states no monthly used/cap to derive one
-// from.
+// summary metric, never as a bucket: a bucket's only figure is a remaining
+// fraction (QuotaBucket has no absolute-value field), and upstream states no
+// monthly used/cap to derive one from.
 type quotaMonthlyCredit struct {
 	Remaining float64
 	ResetAt   *time.Time

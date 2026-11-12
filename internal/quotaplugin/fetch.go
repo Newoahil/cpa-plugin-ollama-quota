@@ -455,11 +455,11 @@ func quotaResponse(entry reading, staleReason string) pluginapi.QuotaFetchRespon
 	}
 
 	// The monthly plan credit is a figure, not a window. Command Code states
-	// the remaining amount but no used/cap pair, and the host drops every
-	// bucket without a remainingFraction — so a bucket here would have to
-	// invent a percentage upstream never stated. The reset date rides in the
-	// label instead: QuotaMetric has no reset field, and the management page
-	// renders the label verbatim.
+	// the remaining amount but no used/cap pair, and a QuotaBucket carries a
+	// remainingFraction as its only figure — no absolute-value field exists —
+	// so a bucket here could only express an invented percentage or a default
+	// 0. The reset date rides in the label instead: QuotaMetric has no reset
+	// field, and the management page renders the label verbatim.
 	if monthly := snapshot.Monthly; monthly != nil {
 		label := "Monthly remaining"
 		if monthly.ResetAt != nil {

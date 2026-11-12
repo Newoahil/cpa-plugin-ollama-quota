@@ -210,12 +210,17 @@ func resetTime(raw json.RawMessage) (time.Time, bool) {
 	if text == "" || text == "null" {
 		return time.Time{}, false
 	}
+	return millisTime(text)
+}
+
+// millisTime converts Unix milliseconds, spelled as a JSON number or a numeric
+// string, to an instant. The plausible range keeps a value in seconds (or
+// nonsense) from showing up as a year-56000 reset.
+func millisTime(text string) (time.Time, bool) {
 	millis, err := strconv.ParseFloat(text, 64)
 	if err != nil || math.IsNaN(millis) || math.IsInf(millis, 0) || millis <= 0 {
 		return time.Time{}, false
 	}
-	// Bound to a plausible instant so a value in seconds (or nonsense) cannot
-	// show up as a year-56000 reset.
 	if millis < 1e12 || millis > 4e12 {
 		return time.Time{}, false
 	}
@@ -252,16 +257,17 @@ type subscription struct {
 // "no subscription reading", not as a failure.
 //
 // The payload is {"success": bool, "data": {"planId": str, "status": str,
-// "currentPeriodEnd": str}}. An unreadable currentPeriodEnd is dropped rather
-// than guessed at: the monthly figure is still shown, just without a reset
-// date.
+// "currentPeriodEnd": str}}. currentPeriodEnd stays raw so a drifted type (a
+// number, an object) costs the reset date rather than the whole subscription
+// reading. An unreadable value is dropped rather than guessed at: the plan and
+// the monthly figure are still shown, just without a reset date.
 func parseSubscription(body []byte) (subscription, bool) {
 	var payload struct {
 		Success *bool `json:"success"`
 		Data    *struct {
-			PlanID           string `json:"planId"`
-			Status           string `json:"status"`
-			CurrentPeriodEnd string `json:"currentPeriodEnd"`
+			PlanID           string          `json:"planId"`
+			Status           string          `json:"status"`
+			CurrentPeriodEnd json.RawMessage `json:"currentPeriodEnd"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -284,18 +290,23 @@ func parseSubscription(body []byte) (subscription, bool) {
 	return result, true
 }
 
-// periodEndTime reads data.currentPeriodEnd, an RFC3339 instant. Anything
-// unreadable is dropped; nothing is inferred in its place.
-func periodEndTime(text string) (time.Time, bool) {
-	trimmed := strings.TrimSpace(text)
-	if trimmed == "" {
+// periodEndTime reads data.currentPeriodEnd, normally an RFC3339 instant. A
+// number or numeric string is also read as Unix milliseconds, the same
+// tolerance resetTime applies, so a drifted type costs the reset date rather
+// than the whole subscription reading. Anything else is dropped; nothing is
+// inferred in its place.
+func periodEndTime(raw json.RawMessage) (time.Time, bool) {
+	if len(raw) == 0 {
 		return time.Time{}, false
 	}
-	parsed, err := time.Parse(time.RFC3339Nano, trimmed)
-	if err != nil {
+	text := strings.Trim(strings.TrimSpace(string(raw)), `"`)
+	if text == "" || text == "null" {
 		return time.Time{}, false
 	}
-	return parsed.UTC(), true
+	if parsed, err := time.Parse(time.RFC3339Nano, text); err == nil {
+		return parsed.UTC(), true
+	}
+	return millisTime(text)
 }
 
 // planNames maps a vendor plan id to its display name. The table is the

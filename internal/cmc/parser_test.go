@@ -253,6 +253,12 @@ func TestParseSubscriptionWithoutPeriodEnd(t *testing.T) {
 		`{"success":true,"data":{"planId":"individual-pro"}}`,
 		`{"success":true,"data":{"planId":"individual-pro","currentPeriodEnd":""}}`,
 		`{"success":true,"data":{"planId":"individual-pro","currentPeriodEnd":"next tuesday"}}`,
+		// A drifted type is no period end at all — and must not fail the
+		// subscription: a number outside the plausible millisecond range, an
+		// object and a bool all cost the reset date only.
+		`{"success":true,"data":{"planId":"individual-pro","currentPeriodEnd":42}}`,
+		`{"success":true,"data":{"planId":"individual-pro","currentPeriodEnd":{"instant":"2026-12-06"}}}`,
+		`{"success":true,"data":{"planId":"individual-pro","currentPeriodEnd":true}}`,
 	} {
 		sub, ok := parseSubscription([]byte(body))
 		if !ok || sub.Plan != "Pro" {
@@ -260,6 +266,22 @@ func TestParseSubscriptionWithoutPeriodEnd(t *testing.T) {
 		}
 		if sub.CurrentPeriodEnd != nil {
 			t.Errorf("payload %q stated a period end it did not read: %v", body, sub.CurrentPeriodEnd)
+		}
+	}
+}
+
+// The period end is normally an RFC3339 string, but a number (or numeric
+// string) spelled as Unix milliseconds is read too, mirroring resetTime.
+func TestParseSubscriptionReadsPeriodEndAsMillis(t *testing.T) {
+	want := time.UnixMilli(1796000000000).UTC()
+	for _, periodEnd := range []string{`1796000000000`, `"1796000000000"`} {
+		body := `{"success":true,"data":{"planId":"individual-pro","currentPeriodEnd":` + periodEnd + `}}`
+		sub, ok := parseSubscription([]byte(body))
+		if !ok || sub.Plan != "Pro" {
+			t.Fatalf("periodEnd %s yielded %+v (%t), want plan Pro", periodEnd, sub, ok)
+		}
+		if sub.CurrentPeriodEnd == nil || !sub.CurrentPeriodEnd.Equal(want) {
+			t.Errorf("periodEnd %s = %v, want %s", periodEnd, sub.CurrentPeriodEnd, want)
 		}
 	}
 }
