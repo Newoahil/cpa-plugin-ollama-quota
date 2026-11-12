@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Plugin version matching plugin.go (for example v0.3.0)
+        description: Plugin version matching plugin.go (for example v0.3.1)
         required: true
         type: string
   push:
