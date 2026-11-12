@@ -47,10 +47,9 @@ var errHostCallbackPanicked = fmt.Errorf("%w: the host callback panicked", ErrHo
 type hostBridge struct {
 	// call is the raw host callback.
 	call HostCall
-	// inflight tracks host calls this plugin has started and not yet seen
-	// return. Quiesce waits on it (see waitInflight): a host call is the only
-	// thing this plugin does that outlives the goroutine that started it, so it
-	// is the only thing that has to be drained before the library is unloaded.
+	// inflight tracks host callbacks and whole asynchronous executor pumps. The
+	// latter stay counted between callbacks too, so quiesce cannot mistake a
+	// live inference stream for an idle library and unload it.
 	inflight inflightSet
 	// drainChecks counts waitInflight calls that actually examined the
 	// in-flight set. It is a diagnostic: it lets a test tell a real drain
@@ -88,20 +87,21 @@ func newInflightSet() inflightSet {
 	return inflightSet{idle: idle}
 }
 
-// begin registers one outstanding call. A call begun after the set is frozen is
-// not counted: quiesce has already passed the barrier and the host will refuse
-// or cancel it.
-func (s *inflightSet) begin() {
+// begin registers one outstanding call and reports whether it was counted. A
+// call begun after freeze is not counted, so it must not retire another call's
+// entry with end. Long-lived executor streams also reserve one entry here.
+func (s *inflightSet) begin() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.frozen {
-		return
+		return false
 	}
 	if !s.open {
 		s.idle = make(chan struct{})
 		s.open = true
 	}
 	s.count++
+	return true
 }
 
 // end retires one outstanding call.
@@ -192,8 +192,9 @@ func (b *hostBridge) invoke(ctx context.Context, method string, payload any, out
 	// call as in flight for the whole duration. Deferring it would register the
 	// call only when it was already over, and the quiesce barrier would see an
 	// always-empty set.
-	b.inflight.begin()
-	defer b.inflight.end()
+	if b.inflight.begin() {
+		defer b.inflight.end()
+	}
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = errHostCallbackPanicked
