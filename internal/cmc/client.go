@@ -122,7 +122,11 @@ func refuseRedirects(*http.Request, []*http.Request) error { return http.ErrUseL
 // is turned into a network-class failure with no figures.
 //
 // The credits call is required; the subscriptions call is best effort, so a
-// plan lookup that fails still yields the balance and the windows.
+// plan lookup that fails still yields the balance and the windows. The monthly
+// remaining figure is attached only after a successful subscription read: the
+// credits endpoint states a remaining amount but not what it is an allowance
+// of, and a figure presented as a plan's monthly credit should come from an
+// account confirmed to be on a plan.
 func (c *Client) Fetch(ctx context.Context, credential Credential) (snapshot Snapshot, err error) {
 	observedAt := c.safeNow()
 	defer func() {
@@ -147,10 +151,17 @@ func (c *Client) Fetch(ctx context.Context, credential Credential) (snapshot Sna
 	}
 	snapshot = Snapshot{Balance: parsed.Balance, Windows: parsed.Windows, ObservedAt: observedAt}
 
-	// Best effort: a subscription lookup that fails costs the plan name only.
+	// Best effort: a subscription lookup that fails costs the plan name and the
+	// monthly figure, nothing more.
 	if body, errSub := c.get(ctx, credential.APIKey, SubscriptionPath, "subscriptions"); errSub == nil {
-		if plan, ok := parseSubscription(body); ok {
-			snapshot.Plan = plan
+		if sub, ok := parseSubscription(body); ok {
+			snapshot.Plan = sub.Plan
+			if parsed.MonthlyCredits != nil {
+				snapshot.Monthly = &MonthlyCredit{
+					Remaining: roundCents(*parsed.MonthlyCredits),
+					ResetAt:   sub.CurrentPeriodEnd,
+				}
+			}
 		}
 	}
 	return rejectEcho(snapshot, credential)

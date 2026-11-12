@@ -69,6 +69,55 @@ func TestParseCreditsReadsBalanceAndWindows(t *testing.T) {
 	}
 }
 
+// monthlyCredits is the remaining plan credit and is kept apart from the
+// balance sum: it is what the monthly figure is built from.
+func TestParseCreditsReadsMonthlyCredits(t *testing.T) {
+	parsed, err := parseCredits([]byte(creditsFixture))
+	if err != nil {
+		t.Fatalf("parse credits: %v", err)
+	}
+	if parsed.MonthlyCredits == nil || *parsed.MonthlyCredits != 12.5 {
+		t.Errorf("monthly credits = %v, want 12.5", parsed.MonthlyCredits)
+	}
+}
+
+// A monthly figure that is missing, null, non-numeric or negative is not shown
+// at all — and it must not cost the rest of the reading. A numeric string is
+// accepted because upstream spells some numbers that way elsewhere.
+func TestParseCreditsSkipsUnusableMonthlyCredits(t *testing.T) {
+	cases := []struct {
+		name        string
+		body        string
+		want        *float64
+		wantBalance float64
+	}{
+		{"missing", `{"credits":{"purchasedCredits":3}}`, nil, 3},
+		{"null", `{"credits":{"monthlyCredits":null,"purchasedCredits":3}}`, nil, 3},
+		{"string", `{"credits":{"monthlyCredits":"12.5","purchasedCredits":3}}`, ptr(12.5), 15.5},
+		{"not a number", `{"credits":{"monthlyCredits":"lots","purchasedCredits":3}}`, nil, 3},
+		{"negative", `{"credits":{"monthlyCredits":-1,"purchasedCredits":3}}`, nil, 3},
+	}
+	for _, tc := range cases {
+		parsed, err := parseCredits([]byte(tc.body))
+		if err != nil {
+			t.Errorf("%s: parse credits: %v", tc.name, err)
+			continue
+		}
+		switch {
+		case tc.want == nil && parsed.MonthlyCredits != nil:
+			t.Errorf("%s: monthly credits = %v, want none", tc.name, *parsed.MonthlyCredits)
+		case tc.want != nil && (parsed.MonthlyCredits == nil || *parsed.MonthlyCredits != *tc.want):
+			t.Errorf("%s: monthly credits = %v, want %v", tc.name, parsed.MonthlyCredits, *tc.want)
+		}
+		// The purchased bucket still reaches the balance in every case above.
+		if parsed.Balance == nil || parsed.Balance.Amount != tc.wantBalance {
+			t.Errorf("%s: balance = %+v, want %v", tc.name, parsed.Balance, tc.wantBalance)
+		}
+	}
+}
+
+func ptr(value float64) *float64 { return &value }
+
 // The resetAt values are Unix MILLISECONDS: 1762000000000 ms is 2025-11-01
 // 12:26:40 UTC. Treating them as seconds would land in the year 57800.
 func TestParseCreditsConvertsResetMilliseconds(t *testing.T) {
@@ -178,11 +227,62 @@ func TestParseCreditsSkipsWindowsWhenUnlimited(t *testing.T) {
 	}
 }
 
-func TestParseSubscriptionReadsPlan(t *testing.T) {
-	body := `{"success":true,"data":{"planId":"individual-pro","status":"active","currentPeriodEnd":"2026-10-16T04:03:37.000Z"}}`
-	plan, ok := parseSubscription([]byte(body))
-	if !ok || plan != "Pro" {
-		t.Errorf("plan = %q (%t), want Pro", plan, ok)
+func TestParseSubscriptionReadsPlanAndPeriodEnd(t *testing.T) {
+	body := `{"success":true,"data":{"planId":"individual-pro","status":"active","currentPeriodEnd":"2026-12-06T08:02:28.000Z"}}`
+	sub, ok := parseSubscription([]byte(body))
+	if !ok {
+		t.Fatal("subscription must parse")
+	}
+	if sub.Plan != "Pro" {
+		t.Errorf("plan = %q, want Pro", sub.Plan)
+	}
+	// The raw id is kept as stated, apart from surrounding space.
+	if sub.PlanID != "individual-pro" {
+		t.Errorf("plan id = %q, want individual-pro", sub.PlanID)
+	}
+	want := time.Date(2026, 12, 6, 8, 2, 28, 0, time.UTC)
+	if sub.CurrentPeriodEnd == nil || !sub.CurrentPeriodEnd.Equal(want) {
+		t.Errorf("period end = %v, want %s", sub.CurrentPeriodEnd, want)
+	}
+}
+
+// A subscription with no readable period end is still a subscription: the plan
+// is shown, the reset date is simply absent.
+func TestParseSubscriptionWithoutPeriodEnd(t *testing.T) {
+	for _, body := range []string{
+		`{"success":true,"data":{"planId":"individual-pro"}}`,
+		`{"success":true,"data":{"planId":"individual-pro","currentPeriodEnd":""}}`,
+		`{"success":true,"data":{"planId":"individual-pro","currentPeriodEnd":"next tuesday"}}`,
+		// A drifted type is no period end at all — and must not fail the
+		// subscription: a number outside the plausible millisecond range, an
+		// object and a bool all cost the reset date only.
+		`{"success":true,"data":{"planId":"individual-pro","currentPeriodEnd":42}}`,
+		`{"success":true,"data":{"planId":"individual-pro","currentPeriodEnd":{"instant":"2026-12-06"}}}`,
+		`{"success":true,"data":{"planId":"individual-pro","currentPeriodEnd":true}}`,
+	} {
+		sub, ok := parseSubscription([]byte(body))
+		if !ok || sub.Plan != "Pro" {
+			t.Errorf("payload %q yielded %+v (%t), want plan Pro", body, sub, ok)
+		}
+		if sub.CurrentPeriodEnd != nil {
+			t.Errorf("payload %q stated a period end it did not read: %v", body, sub.CurrentPeriodEnd)
+		}
+	}
+}
+
+// The period end is normally an RFC3339 string, but a number (or numeric
+// string) spelled as Unix milliseconds is read too, mirroring resetTime.
+func TestParseSubscriptionReadsPeriodEndAsMillis(t *testing.T) {
+	want := time.UnixMilli(1796000000000).UTC()
+	for _, periodEnd := range []string{`1796000000000`, `"1796000000000"`} {
+		body := `{"success":true,"data":{"planId":"individual-pro","currentPeriodEnd":` + periodEnd + `}}`
+		sub, ok := parseSubscription([]byte(body))
+		if !ok || sub.Plan != "Pro" {
+			t.Fatalf("periodEnd %s yielded %+v (%t), want plan Pro", periodEnd, sub, ok)
+		}
+		if sub.CurrentPeriodEnd == nil || !sub.CurrentPeriodEnd.Equal(want) {
+			t.Errorf("periodEnd %s = %v, want %s", periodEnd, sub.CurrentPeriodEnd, want)
+		}
 	}
 }
 
@@ -193,8 +293,8 @@ func TestParseSubscriptionRejectsFailure(t *testing.T) {
 		`{"success":true,"data":{}}`,
 		`{"success":true}`,
 	} {
-		if plan, ok := parseSubscription([]byte(body)); ok {
-			t.Errorf("payload %q yielded plan %q, want none", body, plan)
+		if sub, ok := parseSubscription([]byte(body)); ok {
+			t.Errorf("payload %q yielded subscription %+v, want none", body, sub)
 		}
 	}
 }

@@ -4,7 +4,7 @@
 // both authenticated with "Authorization: Bearer <API key>":
 //
 //	GET /alpha/billing/credits       remaining credits and the 5-hour/weekly windows
-//	GET /alpha/billing/subscriptions plan identity (best effort)
+//	GET /alpha/billing/subscriptions plan identity and billing period end (best effort)
 //
 // The account API lives on the provider authority but outside the
 // OpenAI-compatible surface a credential's base_url points at
@@ -20,7 +20,7 @@
 // A reading that cannot be verified is never reported: a response the parser
 // does not recognise is a parse failure, not a zero. The subscriptions call is
 // optional; when it fails the credits figure and the windows are still
-// returned, only without a plan name.
+// returned, only without a plan name or the monthly remaining figure.
 //
 // This package is deliberately independent of CPA: it imports no pluginapi type
 // and exposes a plain Go seam (see Transport). A credential's key never appears
@@ -116,12 +116,31 @@ type Window struct {
 	Note string
 }
 
+// MonthlyCredit is the remaining monthly plan credit for the current billing
+// period.
+//
+// It is a figure, not a window: upstream reports the remaining value without a
+// used/cap pair, so there is no percentage to state. A consumer must show the
+// number (with ResetAt, when known) and never derive a fraction from it.
+type MonthlyCredit struct {
+	// Remaining is the plan credit still available this period.
+	Remaining float64
+	// ResetAt is when the billing period ends and the allowance renews, when
+	// the subscription stated it.
+	ResetAt *time.Time
+}
+
 // Snapshot is one collection result.
 type Snapshot struct {
-	// Plan is the subscription's planId, when the subscription call succeeded.
+	// Plan is the subscription's display name, when the subscription call
+	// succeeded.
 	Plan string
 	// Balance is the remaining credit figure, nil when upstream reported none.
 	Balance *Balance
+	// Monthly is the remaining monthly plan credit. It is only present when the
+	// subscription call succeeded: without it the account is not confirmed to
+	// be on a plan with a monthly allowance.
+	Monthly *MonthlyCredit
 	// Windows holds the quota windows, five-hour first.
 	Windows []Window
 	// ObservedAt is when this reading was taken.
@@ -129,7 +148,9 @@ type Snapshot struct {
 }
 
 // HasData reports whether the snapshot carries anything displayable.
-func (s Snapshot) HasData() bool { return s.Balance != nil || len(s.Windows) > 0 }
+func (s Snapshot) HasData() bool {
+	return s.Balance != nil || s.Monthly != nil || len(s.Windows) > 0
+}
 
 // Window returns the window with the given name.
 func (s Snapshot) Window(name string) (Window, bool) {

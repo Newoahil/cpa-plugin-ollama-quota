@@ -24,6 +24,9 @@ type quotaSnapshot struct {
 	Plan string
 	// Balance is the credit figure, nil when the path reported none.
 	Balance *quotaBalance
+	// Monthly is the remaining monthly plan credit, when the provider reports
+	// one. It is a figure, not a window: no denominator is known.
+	Monthly *quotaMonthlyCredit
 	// Windows holds the quota windows, shortest first.
 	Windows []quotaWindow
 	// ObservedAt is when this reading was taken.
@@ -38,6 +41,15 @@ type quotaBalance struct {
 	Currency  string
 	Included  *float64
 	Purchased *float64
+}
+
+// quotaMonthlyCredit is the remaining monthly plan credit. It is rendered as a
+// summary metric, never as a bucket: a bucket's only figure is a remaining
+// fraction (QuotaBucket has no absolute-value field), and upstream states no
+// monthly used/cap to derive one from.
+type quotaMonthlyCredit struct {
+	Remaining float64
+	ResetAt   *time.Time
 }
 
 // quotaWindow is one quota window.
@@ -59,7 +71,7 @@ type quotaWindow struct {
 
 // hasData reports whether the snapshot carries anything displayable.
 func (s quotaSnapshot) hasData() bool {
-	return s.Balance != nil || len(s.Windows) > 0
+	return s.Balance != nil || s.Monthly != nil || len(s.Windows) > 0
 }
 
 // ollamaSnapshot converts an Ollama reading.
@@ -102,6 +114,12 @@ func cmcSnapshot(snapshot cmc.Snapshot) quotaSnapshot {
 			Currency:  snapshot.Balance.Currency,
 			Included:  snapshot.Balance.Included,
 			Purchased: snapshot.Balance.Purchased,
+		}
+	}
+	if snapshot.Monthly != nil {
+		result.Monthly = &quotaMonthlyCredit{
+			Remaining: snapshot.Monthly.Remaining,
+			ResetAt:   snapshot.Monthly.ResetAt,
 		}
 	}
 	for _, window := range snapshot.Windows {
